@@ -1,4 +1,7 @@
-.PHONY: run compare visual diff
+.PHONY: gui run compare visual diff
+
+gui: | venv
+	"$(VENV_PYTHON)" gui.py --port "$(PORT)" $(GUI_ARGS)
 
 run: | venv
 	"$(VENV_PYTHON)" desynth.py "$(INPUT)" $(ARGS)

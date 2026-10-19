@@ -1,0 +1,623 @@
+"""Local browser UI for DeSynth. Run: python gui.py [--port 7860]."""
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import gc
+import importlib.util
+import io
+import ipaddress
+import json
+import math
+import secrets
+import socket
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+ROOT = Path(__file__).resolve().parent
+STORE = ROOT / "out" / "gui"
+WEB = ROOT / "web"
+MAX_BODY = 48 * 1024 * 1024
+MAX_IMAGE = 32 * 1024 * 1024
+MAX_PIXELS = 36_000_000
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS
+
+
+class APIError(Exception):
+    def __init__(self, message, status=400):
+        self.status = status
+        super().__init__(message)
+
+
+def number(value, name, low, high, integer=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise APIError(f"{name}: a finite number is required.")
+    if not low <= value <= high or (integer and int(value) != value):
+        raise APIError(f"{name}: expected a value between {low} and {high}.")
+    return int(value) if integer else float(value)
+
+
+def parameters(raw, process=False):
+    if not isinstance(raw, dict):
+        raise APIError("params must be an object.")
+    result = {
+        "restore_sigma": number(raw.get("restore_sigma", 1.95), "restore_sigma", 0.1, 10),
+        "unsharp": number(raw.get("unsharp", 0), "unsharp", 0, 3),
+        "restore_mode": raw.get("restore_mode", "gaussian"),
+        "restore": raw.get("restore", True),
+    }
+    if result["restore_mode"] not in ("gaussian", "edge"):
+        raise APIError("restore_mode must be gaussian or edge.")
+    if not isinstance(result["restore"], bool):
+        raise APIError("restore must be a boolean.")
+    if process:
+        result.update(
+            denoise=number(raw.get("denoise", .25), "denoise", .01, 1),
+            steps=number(raw.get("steps", 8), "steps", 1, 64, True),
+            passes=number(raw.get("passes", 1), "passes", 1, 8, True),
+            seed=raw.get("seed"), transformer=raw.get("transformer"),
+            preview=raw.get("preview", False), keep_intermediate=raw.get("keep_intermediate", False),
+            device=raw.get("device", "auto"), offload=raw.get("offload", "auto"),
+            precision=raw.get("precision", "auto"),
+        )
+        device = result["device"]
+        if not isinstance(device, str) or not (device in ("auto", "cpu", "mps") or device.startswith("cuda:") and device[5:].isdigit()):
+            raise APIError("Unknown device. Choose auto, cpu, mps or an available cuda:N device.")
+        if result["offload"] not in ("auto", "sequential", "model", "none"):
+            raise APIError("offload must be auto, sequential, model or none.")
+        if result["precision"] not in ("auto", "bfloat16", "float16", "float32"):
+            raise APIError("precision must be auto, bfloat16, float16 or float32.")
+        if result["seed"] is not None:
+            result["seed"] = number(result["seed"], "seed", 0, 2**63 - 9, True)
+        if result["steps"] - int(max(result["steps"] - min(result["steps"] * result["denoise"], result["steps"]), 0)) < 1:
+            raise APIError("These settings produce no processing steps. Increase steps or denoise.")
+        for field in ("preview", "keep_intermediate"):
+            if not isinstance(result[field], bool):
+                raise APIError(f"{field} must be a boolean.")
+    return result
+
+
+def finite_json(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: finite_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [finite_json(item) for item in value]
+    return value
+
+
+class Studio:
+    def __init__(self):
+        STORE.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.cpu_lock = threading.Lock()
+        self.assets, self.paths, self.jobs, self.clean_sources, self.started = {}, {}, {}, {}, {}
+        self.active = None
+        self.pipe = self.pipe_path = self.pipe_key = self.embeds = self.module = None
+        self.device = "Detecting device…"
+        self.runtime = {"ready": False, "devices": [{"id": "cpu", "name": "CPU", "type": "cpu",
+                         "precisions": ["float32"], "offload_modes": ["none"]}], "default_device": "cpu"}
+        self.models = [{"name": p.name, "path": p.name} for p in sorted(ROOT.glob("*.gguf"), key=lambda p: ("Q4" not in p.name.upper(), p.name)) if p.is_file()]
+        self.default_source = self.default_result = None
+        originals = sorted(p for p in ROOT.iterdir() if p.name.lower() == "original.png")
+        if originals:
+            self.default_source = self.register(originals[0], "source")["id"]
+        for path in sorted((ROOT / "out").glob("*desynth*.png"), key=lambda item: item.stat().st_mtime):
+            if path.name.lower().startswith("comparison_"):
+                continue
+            try:
+                asset = self.register(path, "result")
+                if path.name.lower().startswith("original_desynth"):
+                    self.default_result = asset["id"]
+            except (OSError, ValueError, Image.DecompressionBombError):
+                continue
+        threading.Thread(target=self.probe_device, daemon=True).start()
+
+    def probe_device(self):
+        try:
+            probe = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=5)
+            self.device = f"{probe.stdout.strip().splitlines()[0]} · checking CUDA" if probe.returncode == 0 and probe.stdout.strip() else "Checking device…"
+        except (OSError, subprocess.TimeoutExpired):
+            self.device = "Checking device…"
+        try:
+            import torch
+            devices = list(self.runtime["devices"])
+            if torch.cuda.is_available():
+                for index in range(torch.cuda.device_count()):
+                    with torch.cuda.device(index):
+                        bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
+                    devices.append({"id": f"cuda:{index}", "name": torch.cuda.get_device_name(index), "type": "cuda",
+                                    "precisions": (["bfloat16"] if bf16 else []) + ["float32"],
+                                    "offload_modes": ["sequential", "model", "none"]})
+            if torch.backends.mps.is_available():
+                precisions = ["float32"]
+                try:
+                    probe_tensor = torch.zeros(1, device="mps", dtype=torch.bfloat16)
+                    del probe_tensor
+                    precisions.insert(0, "bfloat16")
+                except (RuntimeError, TypeError):
+                    pass
+                devices.append({"id": "mps", "name": "Apple Silicon", "type": "mps", "precisions": precisions,
+                                "offload_modes": ["model", "none"]})
+            default = next((d for d in devices if d["type"] == "cuda"), next((d for d in devices if d["type"] == "mps"), devices[0]))
+            with self.lock:
+                self.runtime = {"ready": True, "devices": devices, "default_device": default["id"]}
+                self.device = f"{default['type'].upper()} · {default['name']}" if default["type"] != "cpu" else "CPU"
+        except Exception as exc:
+            with self.lock:
+                self.runtime = {**self.runtime, "ready": True, "error": str(exc)}
+                self.device = "CPU"
+
+    def resolve_runtime(self, params):
+        with self.lock:
+            inventory = self.runtime
+        if not inventory["ready"]:
+            raise APIError("Devices are still being checked. Please retry in a moment.")
+        device_id = inventory["default_device"] if params["device"] == "auto" else params["device"]
+        capability = next((device for device in inventory["devices"] if device["id"] == device_id), None)
+        if capability is None:
+            raise APIError(f"Device {device_id} is unavailable. Select a device from the available list.")
+        offload = params["offload"]
+        if offload == "auto":
+            offload = "sequential" if capability["type"] == "cuda" else "model" if capability["type"] == "mps" else "none"
+        if offload not in capability["offload_modes"]:
+            raise APIError(f"{offload} offload is not supported on {capability['name']}. Choose {', '.join(capability['offload_modes'])}.")
+        precision = params["precision"]
+        if precision == "auto":
+            precision = "bfloat16" if "bfloat16" in capability["precisions"] else "float32"
+        if precision not in capability["precisions"]:
+            if precision == "float16":
+                raise APIError("Qwen-Image can overflow in float16 and produce a black image. Choose bfloat16 (if available) or float32.")
+            raise APIError(f"{precision} precision is not supported on {capability['name']}. Choose {', '.join(capability['precisions'])}.")
+        return {"device": device_id, "offload": offload, "precision": precision, "device_name": capability["name"]}
+
+    def register(self, path, kind, name=None):
+        with Image.open(path) as image:
+            width, height = image.size
+            if width * height > MAX_PIXELS:
+                raise ValueError("Image is too large. Maximum: 36 megapixels.")
+        asset_id = secrets.token_hex(16)
+        asset = dict(id=asset_id, name=name or path.name, width=width, height=height,
+                     url=f"/api/image/{asset_id}", kind=kind)
+        with self.lock:
+            self.assets[asset_id], self.paths[asset_id] = asset, path
+        return asset
+
+    def asset(self, asset_id, kind=None):
+        if not isinstance(asset_id, str) or asset_id not in self.assets:
+            raise APIError("Image not found. Please upload it again.", 404)
+        asset = self.assets[asset_id]
+        if kind and asset["kind"] != kind:
+            raise APIError(f"Expected an image of type {kind}.")
+        return asset
+
+    def image(self, asset_id):
+        self.asset(asset_id)
+        with Image.open(self.paths[asset_id]) as image:
+            return ImageOps.exif_transpose(image).convert("RGBA")
+
+    def save(self, image, kind, name):
+        path = STORE / f"{secrets.token_hex(16)}.png"
+        image.save(path, format="PNG")
+        return self.register(path, kind, name)
+
+    def state(self):
+        missing = [name for name in ("embeds_cache.pt", "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors") if not (ROOT / name).is_file()]
+        if not self.models:
+            missing.append("GGUF transformer")
+        missing += [name for name in ("torch", "diffusers", "numpy", "cv2", "skimage") if importlib.util.find_spec(name) is None]
+        with self.lock:
+            return dict(device=self.device, ready=not missing, models=self.models, assets=list(self.assets.values()),
+                        default_source_id=self.default_source, default_result_id=self.default_result,
+                        missing=missing, active_job_id=self.active, runtime=self.runtime)
+
+    def upload(self, payload):
+        role = payload.get("role", "source")
+        if role not in ("source", "result"):
+            raise APIError("role must be source or result.")
+        data = payload.get("data")
+        if not isinstance(data, str):
+            raise APIError("Image data is missing.")
+        if data.startswith("data:"):
+            if ";base64," not in data[:128]:
+                raise APIError("A base64-encoded image is required.")
+            data = data.split(",", 1)[1]
+        try:
+            decoded = base64.b64decode(data, validate=True)
+            if len(decoded) > MAX_IMAGE:
+                raise APIError("File is too large. Maximum: 32 MB.", 413)
+            with Image.open(io.BytesIO(decoded)) as source:
+                if source.width * source.height > MAX_PIXELS:
+                    raise APIError("Image is too large. Maximum: 36 megapixels.", 413)
+                image = ImageOps.exif_transpose(source).convert("RGBA")
+        except (binascii.Error, OSError, UnidentifiedImageError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+            raise APIError("Cannot read this image. Use PNG, JPEG or WebP up to 36 megapixels.") from exc
+        name = payload.get("name", "image.png")
+        if not isinstance(name, str):
+            raise APIError("name must be a string.")
+        return self.save(image, role, Path(name.replace("\\", "/")).name[:160] or "image.png")
+
+    def compare(self, source_id, result_id):
+        import numpy as np
+        a, b = self.image(source_id), self.image(result_id)
+        if a.size != b.size:
+            raise APIError("Image dimensions differ. Comparison requires images of the same size.")
+        aa, bb = np.asarray(a), np.asarray(b)
+        if min(a.size) >= 7:
+            from compare import metrics
+            result = metrics(np.ascontiguousarray(aa[..., :3]), np.ascontiguousarray(bb[..., :3]))
+        else:
+            delta = aa[..., :3].astype("float64") - bb[..., :3]
+            mse = float(np.square(delta).mean())
+            result = dict(mae=float(np.abs(delta).mean()), mse=mse, ssim=None,
+                          psnr_db=float(10 * np.log10(255**2 / mse)) if mse else None)
+        changed = np.any(aa != bb, axis=2)
+        result.update(changed_pct=float(changed.mean() * 100), identical=not bool(changed.any()),
+                      mean_alpha=float(np.abs(aa[..., 3].astype("float32") - bb[..., 3]).mean()))
+        return finite_json(result)
+
+    def restore_image(self, clean, original, params):
+        if params["restore"]:
+            final = self.module._restore(clean, original, sigma=params["restore_sigma"],
+                                         mode=params["restore_mode"], unsharp_strength=params["unsharp"])
+        else:
+            final = clean.convert("RGB")
+        if final.size != original.size:
+            final = final.resize(original.size, Image.Resampling.LANCZOS)
+        final = final.convert("RGBA")
+        final.putalpha(original.getchannel("A"))
+        return final
+
+    def quick_restore(self, payload):
+        source_id, clean_id = payload.get("source_id"), payload.get("clean_id")
+        self.asset(source_id, "source")
+        self.asset(clean_id, "clean")
+        if self.clean_sources.get(clean_id) != source_id:
+            raise APIError("This clean result belongs to a different source image.")
+        params = parameters(payload.get("params", {}))
+        with self.cpu_lock:
+            image = self.restore_image(self.image(clean_id), self.image(source_id), params)
+            asset = self.save(image, "result", "desynth_restored.png")
+            return dict(result=asset, metrics=self.compare(source_id, asset["id"]))
+
+    def process(self, payload):
+        source_id = payload.get("source_id")
+        self.asset(source_id, "source")
+        params = parameters(payload.get("params", {}), process=True)
+        requested = params["transformer"]
+        if requested is not None and requested not in [model["path"] for model in self.models]:
+            raise APIError("Select a GGUF model from the available models.")
+        if not self.state()["ready"]:
+            raise APIError("Environment is not ready. Run make setup and make models; check embeds_cache.pt.", 503)
+        runtime = self.resolve_runtime(params)
+        if params["seed"] is None:
+            params["seed"] = secrets.randbits(31)
+        job_id = secrets.token_hex(16)
+        with self.lock:
+            if self.active:
+                raise APIError("Processing is already running. Wait for the current job to finish.", 409)
+            job = dict(id=job_id, status="queued", progress=0, stage="Queued", elapsed=0,
+                       seed=params["seed"], source_id=source_id, result=None, clean=None, metrics=None, error=None)
+            job.update(runtime=runtime, requested_runtime={key: params[key] for key in ("device", "offload", "precision")})
+            self.jobs[job_id] = job
+            self.started[job_id] = time.monotonic()
+            self.active = job_id
+        threading.Thread(target=self.work, args=(job_id, source_id, params), daemon=True).start()
+        return dict(job)
+
+    def work(self, job_id, source_id, params):
+        job, started = self.jobs[job_id], self.started[job_id]
+
+        def update(**values):
+            with self.lock:
+                job.update(values, elapsed=round(time.monotonic() - started, 1))
+
+        try:
+            update(status="running", stage="Loading libraries", progress=2)
+            if self.module is None:
+                import desynth
+                self.module = desynth
+            ds = self.module
+            runtime = job["runtime"]
+            dtype = getattr(ds.torch, runtime["precision"])
+            original = self.image(source_id)
+            image = original.convert("RGB")
+            if params["preview"] and max(image.size) > 768:
+                ratio = 768 / max(image.size)
+                image = image.resize(tuple(max(16, int(size * ratio) // 16 * 16) for size in image.size), Image.Resampling.LANCZOS)
+            work_size = tuple(max(16, size // 16 * 16) for size in image.size)
+            if image.size != work_size:
+                image = image.resize(work_size, Image.Resampling.LANCZOS)
+            update(preview_size=list(image.size), stage="Loading embeddings", progress=5)
+            if self.embeds is None:
+                self.embeds = ds.torch.load(ds.EMBEDS_CACHE, map_location="cpu", weights_only=False)
+            # Cached embeddings stay on CPU. Each job gets the selected precision
+            # and device, including masks needed when no offload hooks are active.
+            embeds = {}
+            for key in ("prompt_embeds", "negative_prompt_embeds", "prompt_embeds_mask", "negative_prompt_embeds_mask"):
+                value = self.embeds[key]
+                embeds[key] = value.to(device=runtime["device"], dtype=dtype if value.is_floating_point() else value.dtype)
+            candidates = [params["transformer"]] if params["transformer"] else [m["path"] for m in self.models]
+            clean = None
+            for candidate in candidates:
+                try:
+                    pipe_key = (candidate, runtime["device"], runtime["offload"], runtime["precision"])
+                    if self.pipe_key != pipe_key or self.pipe is None:
+                        self.drop_pipeline()
+                        update(stage=f"Loading {candidate} (first run takes longer)", progress=7)
+                        self.pipe = ds.build_pipeline(ROOT / candidate, device=runtime["device"],
+                                                      offload=runtime["offload"], compute_dtype=dtype)
+                        self.pipe_path = candidate
+                        self.pipe_key = pipe_key
+                    current = image
+                    for pass_index in range(params["passes"]):
+                        def step_end(pipe, step, timestep, callback_kwargs):
+                            count = max(1, getattr(pipe, "num_timesteps", int(params["steps"] * params["denoise"])))
+                            update(stage=f"Pass {pass_index + 1}/{params['passes']} · step {step + 1}/{count}",
+                                   progress=min(88, 12 + 76 * (pass_index + (step + 1) / count) / params["passes"]))
+                            return callback_kwargs
+                        update(stage=f"Pass {pass_index + 1}/{params['passes']} · encoding image")
+                        with ds.torch.inference_mode():
+                            current = ds._sample(self.pipe, current, embeds, denoise=params["denoise"],
+                                                 steps=params["steps"], seed=params["seed"] + pass_index,
+                                                 width=image.width, height=image.height,
+                                                 callback_on_step_end=step_end)
+                    clean = current
+                    break
+                except Exception as exc:
+                    self.drop_pipeline()
+                    if ds._is_oom(exc) and candidate != candidates[-1]:
+                        update(stage="Out of memory: trying a smaller model", progress=7)
+                        continue
+                    raise
+            update(stage="Restoring details", progress=90)
+            clean_asset = self.save(clean.convert("RGBA"), "clean", "desynth_clean.png")
+            self.clean_sources[clean_asset["id"]] = source_id
+            final = self.restore_image(clean, original, params)
+            result = self.save(final, "result", f"{Path(self.assets[source_id]['name']).stem}_desynth_seed{params['seed']}.png")
+            update(stage="Comparing RGBA channels", progress=95, clean=clean_asset, result=result)
+            with self.cpu_lock:
+                metrics = self.compare(source_id, result["id"])
+            update(status="done", stage="Done", progress=100, metrics=metrics)
+        except Exception as exc:
+            traceback.print_exc()
+            message = str(exc) or type(exc).__name__
+            if self.module and self.module._is_oom(exc):
+                self.drop_pipeline()
+                message = "Out of memory. Use a smaller image, choose sequential offload on CUDA, or select a Q2 GGUF model. " + message
+            update(status="error", stage="Processing failed", error=message[:1800])
+        finally:
+            with self.lock:
+                self.active = None
+
+    def drop_pipeline(self):
+        if self.pipe is not None:
+            old, self.pipe, self.pipe_path, self.pipe_key = self.pipe, None, None, None
+            self.module._free_pipeline(old)
+            del old
+            gc.collect()
+            if self.module.torch.cuda.is_available():
+                for index in range(self.module.torch.cuda.device_count()):
+                    with self.module.torch.cuda.device(index):
+                        self.module.torch.cuda.empty_cache()
+
+
+class LocalServer(ThreadingHTTPServer):
+    # Browser image and API requests arrive in bursts, especially during startup.
+    request_queue_size = 64
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "DeSynth/1.0"
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
+    timeout = 30
+
+    @property
+    def studio(self):
+        return self.server.studio
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            # Browsers may abort a pending restore or close an idle connection.
+            self.close_connection = True
+
+    def send_json(self, status, value):
+        data = json.dumps(finite_json(value), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        self.send_bytes(status, data, "application/json; charset=utf-8")
+
+    def log_request(self, code="-", size="-"):
+        if str(code) == "200" and urlsplit(self.path).path.startswith("/api/job/"):
+            return
+        super().log_request(code, size)
+
+    def send_bytes(self, status, data, content_type, filename=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Connection", "close" if self.close_connection else "keep-alive")
+        if filename:
+            self.send_header("Content-Disposition", 'inline; filename="image.png"')
+        self.end_headers()
+        self.wfile.write(data)
+        self.wfile.flush()
+
+    def check_origin(self, mutate=False):
+        host = self.headers.get("Host", "")
+        parsed = urlsplit("http://" + host)
+        try:
+            valid_port = parsed.port == self.server.server_port
+        except ValueError:
+            valid_port = False
+        if parsed.hostname not in ("localhost", "127.0.0.1", "::1") or not valid_port or parsed.username or parsed.password:
+            raise APIError("Only the local server address is allowed.", 403)
+        origin = self.headers.get("Origin")
+        if origin and origin != "http://" + host:
+            raise APIError("Requests from another origin are not allowed.", 403)
+        if mutate and self.headers.get("Sec-Fetch-Site") == "cross-site":
+            raise APIError("Requests from another origin are not allowed.", 403)
+
+    def do_GET(self):
+        try:
+            self.check_origin()
+            path = urlsplit(self.path).path
+            if path == "/health":
+                return self.send_json(200, {"ok": True})
+            if path == "/favicon.ico":
+                return self.send_bytes(204, b"", "image/x-icon")
+            if path == "/api/state":
+                return self.send_json(200, self.studio.state())
+            if path.startswith("/api/image/"):
+                asset_id = path.removeprefix("/api/image/")
+                self.studio.asset(asset_id)
+                return self.send_bytes(200, self.studio.paths[asset_id].read_bytes(), "image/png")
+            if path.startswith("/api/pixels/"):
+                asset_id = path.removeprefix("/api/pixels/")
+                return self.send_bytes(200, self.studio.image(asset_id).tobytes(), "application/octet-stream")
+            if path.startswith("/api/job/"):
+                with self.studio.lock:
+                    job = self.studio.jobs.get(path.removeprefix("/api/job/"))
+                    if not job:
+                        raise APIError("Job not found.", 404)
+                    if job["status"] in ("running", "queued"):
+                        job["elapsed"] = round(time.monotonic() - self.studio.started[job["id"]], 1)
+                    return self.send_json(200, dict(job))
+            files = {"/": ("index.html", "text/html; charset=utf-8"), "/index.html": ("index.html", "text/html; charset=utf-8"),
+                     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                     "/style.css": ("style.css", "text/css; charset=utf-8"), "/styles.css": ("style.css", "text/css; charset=utf-8")}
+            if path not in files:
+                raise APIError("Not found.", 404)
+            filename, mime = files[path]
+            return self.send_bytes(200, (WEB / filename).read_bytes(), mime)
+        except APIError as exc:
+            self.send_json(exc.status, {"error": str(exc)})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def do_POST(self):
+        # Remember what remains unread even when Origin/Content-Type rejects a
+        # request before JSON parsing. Closing a Windows socket with unread data
+        # can reset the connection before the error response reaches the client.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = None
+        remaining = length if length is not None and 0 <= length <= MAX_BODY and not self.headers.get("Transfer-Encoding") else None
+        try:
+            self.check_origin(mutate=True)
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                raise APIError("Content-Type: application/json is required.", 415)
+            if self.headers.get("Transfer-Encoding"):
+                raise APIError("Transfer-Encoding is not supported. Send Content-Length.")
+            if length is None:
+                raise APIError("Invalid request length.")
+            if not 0 < length <= MAX_BODY:
+                raise APIError("Request is too large or empty. Maximum: 48 MB.", 413)
+            body = self.rfile.read(length)
+            remaining -= len(body)
+            if remaining:
+                raise APIError("Incomplete request body.")
+            try:
+                payload = json.loads(body)
+            except (ValueError, UnicodeError) as exc:
+                raise APIError("Invalid JSON.") from exc
+            if not isinstance(payload, dict):
+                raise APIError("A JSON object is required.")
+            path = urlsplit(self.path).path
+            if path == "/api/upload":
+                return self.send_json(200, self.studio.upload(payload))
+            if path == "/api/process":
+                return self.send_json(202, self.studio.process(payload))
+            if path == "/api/restore":
+                return self.send_json(200, self.studio.quick_restore(payload))
+            if path == "/api/compare":
+                with self.studio.cpu_lock:
+                    return self.send_json(200, self.studio.compare(payload.get("source_id"), payload.get("result_id")))
+            raise APIError("Not found.", 404)
+        except APIError as exc:
+            if remaining:
+                previous_timeout = self.connection.gettimeout()
+                self.connection.settimeout(1)
+                try:
+                    while remaining:
+                        chunk = self.rfile.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                except (OSError, TimeoutError):
+                    pass
+                finally:
+                    self.connection.settimeout(previous_timeout)
+            # Fully consumed requests can keep their connection, including
+            # normal parameter errors. Unbounded/incomplete bodies cannot.
+            self.close_connection = self.close_connection or remaining != 0
+            self.send_json(exc.status, {"error": str(exc)})
+            if remaining != 0:
+                try:
+                    self.connection.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            traceback.print_exc()
+            self.send_json(500, {"error": str(exc)})
+
+
+def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    parser = argparse.ArgumentParser(description="DeSynth local GUI")
+    parser.add_argument("--host", default="127.0.0.1", help="loopback address only (127.0.0.1, localhost, ::1)")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--no-browser", action="store_true")
+    args = parser.parse_args()
+    try:
+        local = args.host == "localhost" or ipaddress.ip_address(args.host).is_loopback
+    except ValueError:
+        local = False
+    if not local or args.host not in ("localhost", "127.0.0.1", "::1"):
+        parser.error("--host must be 127.0.0.1, localhost or ::1. This GUI only runs locally.")
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535.")
+    if args.host == "::1":
+        LocalServer.address_family = socket.AF_INET6
+    studio = Studio()
+    try:
+        server = LocalServer((args.host, args.port), Handler)
+    except OSError as exc:
+        parser.exit(1, f"Cannot start the server: {exc}. Choose another --port.\n")
+    server.studio = studio
+    url = f"http://{'[::1]' if args.host == '::1' else args.host}:{server.server_port}"
+    print(f"DeSynth Studio: {url}\nStop: Ctrl+C", flush=True)
+    if not args.no_browser:
+        threading.Timer(.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nDeSynth Studio stopped.")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

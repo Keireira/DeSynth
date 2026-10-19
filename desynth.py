@@ -174,14 +174,39 @@ else:
 print(f"[device] {DEVICE}  dtype={COMPUTE_DTYPE}")
 
 
-def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2ImgPipeline:
+def _place_pipeline(pipe, device: str, offload: str = "auto") -> None:
+    """Place a new pipeline without changing the CLI's process-wide defaults."""
+    target = torch.device(device)
+    if offload == "auto":
+        offload = "sequential" if target.type == "cuda" else "model" if target.type == "mps" else "none"
+    if offload not in ("none", "sequential", "model"):
+        raise ValueError(f"Unsupported offload mode: {offload}")
+    if target.type == "cpu" and offload != "none":
+        raise ValueError("CPU processing requires offload=none.")
+    if target.type == "mps" and offload == "sequential":
+        raise ValueError("Sequential offload is not supported on MPS. Choose model or none.")
+    if offload == "none":
+        pipe.to(str(target))
+    elif target.type == "cuda":
+        method = pipe.enable_sequential_cpu_offload if offload == "sequential" else pipe.enable_model_cpu_offload
+        method(gpu_id=target.index if target.index is not None else 0, device="cuda")
+    else:
+        pipe.enable_model_cpu_offload(device=target.type)
+
+
+def build_pipeline(
+    transformer_path: Path = GGUF_TRANSFORMER, *, device: str | None = None,
+    offload: str = "auto", compute_dtype: torch.dtype | None = None,
+) -> QwenImageImg2ImgPipeline:
+    target = torch.device(device or DEVICE)
+    dtype = compute_dtype or (torch.float32 if target.type == "cpu" else COMPUTE_DTYPE)
+    if target.type == "cpu" and dtype != torch.float32:
+        raise ValueError("CPU processing requires float32 precision.")
     for p in (transformer_path, LIGHTNING_LORA, EMBEDS_CACHE):
         if not p.exists():
             raise FileNotFoundError(
                 f"{p}\n(Run `python precompute_embeds.py` first if embeds_cache.pt is missing.)"
             )
-
-    dtype = COMPUTE_DTYPE
 
     # Offline if cached; download once if not.
     def _load(loader, **kwargs):
@@ -230,22 +255,7 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
         pipe.load_lora_weights(str(LIGHTNING_LORA), adapter_name="lightning")
     pipe.set_adapters(["lightning"], adapter_weights=[0.8])
 
-    # Offload strategy depends on available hardware.
-    #   CUDA:     sequential offload — moves one layer at a time, fits 13GB GGUF
-    #             in 8 GB VRAM (tested config from the original author).
-    #   MPS/CPU:  model-level offload — accelerate moves whole sub-modules;
-    #             sequential offload's internals are CUDA-only in diffusers.
-    #             On CPU this still runs entirely in system RAM.
-    if DEVICE == "cuda":
-        pipe.enable_sequential_cpu_offload()
-    else:
-        # enable_model_cpu_offload falls back to CPU→device per sub-module,
-        # which accelerate supports on MPS as of accelerate>=0.26.
-        try:
-            pipe.enable_model_cpu_offload(device=DEVICE)
-        except TypeError:
-            # Older accelerate doesn't accept 'device' kwarg — move manually.
-            pipe.enable_model_cpu_offload()
+    _place_pipeline(pipe, str(target), offload)
     pipe.vae.enable_tiling()
 
     return pipe
@@ -304,8 +314,11 @@ def _restore(clean_pil, original_pil, *, sigma: float, mode: str = "gaussian", u
     return Image.fromarray(combined.astype("uint8"))
 
 
-def _sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int):
+def _sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int, callback_on_step_end=None, width=None, height=None):
     generator = torch.Generator(device="cpu").manual_seed(seed)
+    callbacks = {"callback_on_step_end": callback_on_step_end} if callback_on_step_end is not None else {}
+    if width is not None and height is not None:
+        callbacks.update(width=width, height=height)
     return pipe(
         image=image,
         prompt_embeds=embeds["prompt_embeds"].unsqueeze(0),
@@ -316,6 +329,7 @@ def _sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int):
         true_cfg_scale=CFG,
         strength=denoise,
         generator=generator,
+        **callbacks,
     ).images[0]
 
 
