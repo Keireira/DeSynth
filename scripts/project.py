@@ -264,8 +264,8 @@ def main() -> None:
     if args.command == "help":
         parser.print_help()
         return
-    if not (3, 10) <= sys.version_info[:2] < (3, 14):
-        parser.exit(1, "Use Python 3.11 (supported: 3.10 through 3.13) for the pinned PyTorch release.\n")
+    if not (3, 11) <= sys.version_info[:2] < (3, 14):
+        parser.exit(1, "Use Python 3.11 (supported: 3.11 through 3.13) for the pinned dependencies.\n")
     directory = (ROOT / args.venv).resolve()
     backend = args.backend
     if backend == "auto":
