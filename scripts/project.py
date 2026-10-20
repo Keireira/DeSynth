@@ -11,6 +11,11 @@ import venv
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# Direct script execution puts scripts/, rather than the project root, on sys.path.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import model_catalog
+
 MODEL_DIR = ROOT / "ai"
 QWEN_REPO = "Qwen/Qwen-Image"
 GGUF_MODELS = {
@@ -67,18 +72,11 @@ def present(name: str) -> bool:
 
 def find_asset(name: str) -> Path | None:
     """Prefer ai/, retaining compatibility with existing root-level assets."""
-    return next((path for path in (MODEL_DIR / name, ROOT / name)
-                 if path.is_file() and path.stat().st_size > 0), None)
+    return model_catalog.find_asset(name, ROOT)
 
 
 def installed_gguf() -> Path | None:
-    for directory in (MODEL_DIR, ROOT):
-        if directory.is_dir():
-            found = next((path for path in sorted(directory.glob("*.gguf"))
-                          if path.is_file() and path.stat().st_size > 0), None)
-            if found is not None:
-                return found
-    return None
+    return next(iter(model_catalog.discover_models(ROOT)), None)
 
 
 def selected_gguf(model: str) -> Path | None:
@@ -115,6 +113,11 @@ def lightning_candidates(choice: str) -> tuple[str, ...]:
                  for count in steps for precision in ("fp32", "bf16"))
 
 
+def selected_lightning(choice: str) -> Path | None:
+    return next((path for path in model_catalog.discover_adapters(ROOT)
+                 if choice == "auto" or model_catalog.lightning_steps(path) == int(choice)), None)
+
+
 def require_embeds() -> None:
     if not present("embeds_cache.pt"):
         raise RuntimeError("Missing embeds_cache.pt in ai/ or the repository root. Restore the included file.")
@@ -130,7 +133,7 @@ def download_models(lightning: str = "auto", model: str = "auto") -> None:
     models = (
         ("Frederic75/Qwen-Image-2512-GGUF", GGUF_MODELS["q4" if model == "auto" else model], gguf),
         ("lightx2v/Qwen-Image-2512-Lightning", lightning_candidates(lightning),
-         next((find_asset(name) for name in lightning_candidates(lightning) if present(name)), None)),
+         selected_lightning(lightning)),
     )
     for repo, names, existing in models:
         if existing:
@@ -213,7 +216,7 @@ def doctor(backend: str, lightning: str = "auto", model: str = "auto") -> None:
         failures.append(f"Missing GGUF model ({model}). Run make models MODEL={model}.")
     else:
         print(f"GGUF: {gguf}")
-    adapter = next((find_asset(name) for name in lightning_candidates(lightning) if present(name)), None)
+    adapter = selected_lightning(lightning)
     if adapter is None:
         failures.append(f"Missing Lightning LoRA ({lightning}). Run make models LIGHTNING={lightning}.")
     else:
