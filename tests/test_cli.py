@@ -112,7 +112,7 @@ class CLITests(unittest.TestCase):
                 ds.main()
 
     def manifests(self):
-        return [json.loads(path.read_text(encoding="utf-8")) for path in self.out.glob("*.json")]
+        return [json.loads(path.read_text(encoding="utf-8")) for path in self.out.rglob("*.json")]
 
     def assert_rgba_output(self, path):
         with Image.open(path) as result:
@@ -156,6 +156,58 @@ class CLITests(unittest.TestCase):
         manifest, = self.manifests()
         self.assertEqual(len(self.samples), 2)
         self.assertEqual(len({item["path"] for item in manifest["outputs"]}), 2)
+
+    def test_reference_exports_only_final_and_comparison_with_short_names(self):
+        self.cli("--steps", "32", "--denoise", ".125", ".25", "--keep-intermediate")
+        manifest, = self.manifests()
+        expected = {
+            f"{prefix}Original_desynth_s32_d{strength}_p1_r1.95.png"
+            for strength in ("0.125", "0.250") for prefix in ("", "comparison_")
+        }
+        self.assertEqual({path.name for path in self.out.iterdir() if path.is_file()}, expected)
+        archive = self.out / "runs" / manifest["run_id"]
+        for output in manifest["outputs"]:
+            self.assertEqual(Path(output["path"]).parent, archive)
+            self.assertEqual(Path(output["clean_path"]).parent, archive)
+            self.assertEqual(Path(output["comparison_path"]).parent, archive)
+            self.assertEqual(Path(output["reference_path"]).read_bytes(), Path(output["path"]).read_bytes())
+            self.assert_rgba_output(output["reference_path"])
+            with Image.open(output["reference_comparison_path"]) as comparison:
+                self.assertEqual(comparison.mode, "RGB")
+
+    def test_edge_and_sharpen_reference_names_describe_restoration(self):
+        self.cli("--restore-mode", "edge", "--unsharp", ".2")
+        output = self.manifests()[0]["outputs"][0]
+        self.assertEqual(Path(output["reference_path"]).name,
+                         "Original_desynth_s32_d0.250_p1_r1.95_edge_u0.2.png")
+
+    def test_other_image_named_original_does_not_create_reference_exports(self):
+        other = self.root / "elsewhere" / "original.png"
+        other.parent.mkdir()
+        self.source.save(other)
+        self.source_path = other
+        self.cli("--keep-intermediate")
+        manifest, = self.manifests()
+        self.assertEqual([path for path in self.out.iterdir() if path.is_file()], [])
+        output = manifest["outputs"][0]
+        self.assertNotIn("reference_path", output)
+        self.assert_rgba_output(output["path"])
+        self.assert_rgba_output(output["clean_path"])
+
+    def test_reference_alias_is_updated_while_archive_stays_immutable(self):
+        self.cli("--no-restore")
+        first_manifest, = self.manifests()
+        first = first_manifest["outputs"][0]
+        archived_bytes = Path(first["path"]).read_bytes()
+        reference = Path(first["reference_path"])
+        self.assertIn("_norestore.png", reference.name)
+        self.source = Image.new("RGBA", self.source.size, (200, 40, 50, 128))
+        self.source.save(self.source_path)
+        self.cli("--no-restore")
+        self.assertEqual(Path(first["path"]).read_bytes(), archived_bytes)
+        self.assertNotEqual(reference.read_bytes(), archived_bytes)
+        self.assertEqual(len(self.manifests()), 2)
+        self.assertEqual(len(list(self.out.glob("*.png"))), 2)
 
     def test_oom_releases_failed_pipeline_before_loading_smaller_model(self):
         refs, release_checks, loaded = [], [], []

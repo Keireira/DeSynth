@@ -9,15 +9,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
+from processing import load_rgba
 
 ROOT = Path(__file__).parent
 
 
 def load(path: Path) -> np.ndarray:
-    img = cv2.imread(str(path))
-    if img is None:
-        raise SystemExit(f"can't read {path}")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    try:
+        return np.array(load_rgba(path).convert("RGB"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"can't read {path}: {exc}") from exc
 
 
 def _ssim_rgb(a: np.ndarray, b: np.ndarray):

@@ -1,5 +1,4 @@
-# Qwen-Image GGUF img2img + frequency-domain detail restore. Removes SynthID
-# from images while keeping them visually close to the source.
+# Qwen-Image GGUF img2img with frequency-domain source detail restoration.
 
 from __future__ import annotations
 
@@ -88,6 +87,8 @@ GGUF_TRANSFORMER = next(iter(discover_gguf_models()), AI_DIR / "Qwen-Image-2512-
 LIGHTNING_LORA = next(iter(discover_lightning_loras()),
                       AI_DIR / "Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors")
 DEFAULT_LIGHTNING_SCALE = 0.8
+# The explicit img2img sigma calibration below must use this same shift.
+LIGHTNING_SCHEDULER_SHIFT = 3.0
 EMBEDS_CACHE = model_catalog.embeddings_path(ROOT)
 
 
@@ -120,16 +121,14 @@ def _free_pipeline(pipe=None) -> None:
 # HF repo used only for tiny configs and the ~250MB VAE.
 QWEN_IMAGE_REPO = "Qwen/Qwen-Image"
 
-# Img2img slices the total schedule according to denoise (see the effective
-# step helper above for the pipeline's rounding). The 8-step adapter
-# therefore defaults to 32 total steps at strength 0.25. Keep the previous
-# 8-total-step profile when only the legacy 4-step adapter is available.
-# Explicit --steps values are always used as supplied.
+# Keep the full-schedule step budget: denoise determines its effective update
+# count using Diffusers' rounding. Starting noise is calibrated separately.
+# The 8-step adapter defaults to 32 total steps at denoise 0.25; retain the
+# previous 8-total-step budget when only the legacy 4-step adapter is available.
 DEFAULT_STEPS = default_steps_for_lightning(LIGHTNING_LORA)
 CFG = 1.0
 DEFAULT_DENOISE = 0.25
-# SynthID's spatial cutoff is at ~2px. 1.95 is the safe ceiling that takes
-# back maximum detail from the original without dragging the watermark along.
+# Frequency scale of source detail restored after generation.
 DEFAULT_RESTORE_SIGMA = 1.95
 
 # ---------------------------------------------------------------------------
@@ -211,15 +210,15 @@ def build_pipeline(
         dtype=dtype,
     )
 
-    # Both Lightning profiles are distilled with shift=3. Match their official
-    # FlowMatch schedule, including disabling the base model's terminal shift.
+    # Both Lightning profiles use shift=3. Keep that scheduler configuration;
+    # _img2img_sigmas calibrates its input to the requested starting noise.
     # https://github.com/ModelTC/LightX2V-Qwen-Image-Lightning/blob/main/generate_with_diffusers.py
     scheduler = FlowMatchEulerDiscreteScheduler.from_config({
         "base_image_seq_len": 256,
-        "base_shift": math.log(3),
+        "base_shift": math.log(LIGHTNING_SCHEDULER_SHIFT),
         "invert_sigmas": False,
         "max_image_seq_len": 8192,
-        "max_shift": math.log(3),
+        "max_shift": math.log(LIGHTNING_SCHEDULER_SHIFT),
         "num_train_timesteps": 1000,
         "shift": 1.0,
         "shift_terminal": None,
@@ -272,10 +271,9 @@ def _restore_gaussian(clean, original, sigma):
     return (low + high).clip(0, 255)
 
 
-# Edge-aware: two recipes blended by edge mask. At edges, sigma=1.0 pulls
-# more original detail back; in flats, sigma=1.95 keeps the watermark dead.
-# Watermark survives only where edge mask -> 0, so flat skin/sky still clean.
-def _restore_edge(clean, original, sigma_safe, sigma_edge=1.0):
+# A larger Gaussian sigma returns a broader band of source detail. Restore
+# that broader band around source contours, using the chosen sigma elsewhere.
+def _restore_edge(clean, original, sigma_safe, sigma_edge=None):
     import cv2
     import numpy as np
     gray = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY).astype("float32")
@@ -285,6 +283,8 @@ def _restore_edge(clean, original, sigma_safe, sigma_edge=1.0):
     m = mag / (np.percentile(mag, 99) + 1e-6)
     m = np.clip(m, 0, 1)[..., None]
     safe = _restore_gaussian(clean, original, sigma_safe)
+    edge_target = 2 * sigma_safe if sigma_edge is None else sigma_edge
+    sigma_edge = max(sigma_safe, min(edge_target, sigma_safe + 2, 10))
     sharp = _restore_gaussian(clean, original, sigma_edge)
     return (m * sharp + (1 - m) * safe).clip(0, 255)
 
@@ -312,7 +312,29 @@ def _restore(clean_pil, original_pil, *, sigma: float, mode: str = "gaussian", u
     return Image.fromarray(combined.astype("uint8"))
 
 
+def _img2img_sigmas(steps: int, denoise: float):
+    """Keep denoise equal to physical starting noise after Lightning's shift.
+
+    Slicing a shifted full schedule makes strength=.25 start at sigma=.5.
+    Build the intended low-noise trajectory and invert the fixed shift before
+    Diffusers applies it. Keep the existing effective-step rounding separately.
+    """
+    import numpy as np
+
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("steps must be a positive integer")
+    if isinstance(denoise, bool) or not isinstance(denoise, (int, float)) or not math.isfinite(denoise) or not 0 < denoise <= 1:
+        raise ValueError("denoise must be a finite number greater than zero and at most one")
+    actual_steps = effective_img2img_steps(steps, denoise)
+    if actual_steps < 1:
+        raise ValueError("denoise and steps must produce at least one update")
+    target = np.linspace(denoise, 0.0, actual_steps + 1, dtype=np.float64)[:-1]
+    shift = LIGHTNING_SCHEDULER_SHIFT
+    return target / (shift - (shift - 1.0) * target)
+
+
 def _sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int, callback_on_step_end=None, width=None, height=None):
+    sigmas = _img2img_sigmas(steps, denoise)
     generator = torch.Generator(device="cpu").manual_seed(seed)
     callbacks = {"callback_on_step_end": callback_on_step_end} if callback_on_step_end is not None else {}
     if width is not None and height is not None:
@@ -323,9 +345,10 @@ def _sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int, callb
         prompt_embeds_mask=embeds["prompt_embeds_mask"].unsqueeze(0),
         negative_prompt_embeds=embeds["negative_prompt_embeds"].unsqueeze(0),
         negative_prompt_embeds_mask=embeds["negative_prompt_embeds_mask"].unsqueeze(0),
-        num_inference_steps=steps,
+        num_inference_steps=len(sigmas),
+        sigmas=sigmas,
         true_cfg_scale=CFG,
-        strength=denoise,
+        strength=1.0,
         generator=generator,
         **callbacks,
     ).images[0]
@@ -341,6 +364,40 @@ def run_once(pipe, image, embeds, *, denoise: float, steps: int, seed: int, pass
     return current
 
 
+def export_reference_result(final_path: Path, source_path: Path, params: dict,
+                            denoise: float) -> dict:
+    """Publish the root original's final PNG and comparison; retain run files."""
+    if Path(source_path).resolve() != (ROOT / "original.png").resolve():
+        return {}
+
+    import shutil
+    import numpy as np
+    from compare import _draw_visual, metrics
+
+    final_path = Path(final_path)
+    reference_stem = (f"Original_desynth_s{params['steps']}_d{denoise:.3f}"
+                      f"_p{params['passes']}_r{params['restore_sigma']:g}")
+    if not params["restore"]:
+        reference_stem += "_norestore"
+    elif params["restore_mode"] == "edge":
+        reference_stem += "_edge"
+    if params["restore"] and params["unsharp"]:
+        reference_stem += f"_u{params['unsharp']:g}"
+    reference_path = OUT_DIR / f"{reference_stem}.png"
+    comparison_path = final_path.with_name(f"comparison_{final_path.name}")
+    source_rgb = np.asarray(load_rgba(source_path).convert("RGB"))
+    result_rgb = np.asarray(load_rgba(final_path).convert("RGB"))
+    _draw_visual(source_rgb, result_rgb, metrics(source_rgb, result_rgb), comparison_path)
+    reference_comparison = OUT_DIR / f"comparison_{reference_stem}.png"
+    shutil.copyfile(final_path, reference_path)
+    shutil.copyfile(comparison_path, reference_comparison)
+    print(f"  -> {reference_path}  (reference result)")
+    print(f"  -> {reference_comparison}  (reference comparison)")
+    return dict(reference_path=str(reference_path.resolve()),
+                comparison_path=str(comparison_path.resolve()),
+                reference_comparison_path=str(reference_comparison.resolve()))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", nargs="?", default=str(DEFAULT_INPUT), help="input image path")
@@ -349,7 +406,7 @@ def main() -> None:
                         help="total img2img schedule steps; default 32 for 8-step Lightning, 8 for 4-step")
     parser.add_argument("--passes", type=int, default=1, help="sequential img2img passes")
     parser.add_argument("--seed", type=int, default=None, help="random per run if omitted")
-    parser.add_argument("--restore-sigma", type=float, default=DEFAULT_RESTORE_SIGMA, help="freq-restore sigma; cliff at 2.0")
+    parser.add_argument("--restore-sigma", type=float, default=DEFAULT_RESTORE_SIGMA, help="frequency scale of source detail restored after generation")
     parser.add_argument("--restore-mode", choices=["gaussian", "edge"], default="gaussian", help="restore recipe")
     parser.add_argument("--unsharp", type=float, default=0.0, help="post-restore sharpening; try 0.2 for perceptual lift")
     parser.add_argument("--no-restore", dest="restore", action="store_false", help="skip frequency restore")
@@ -428,12 +485,14 @@ def main() -> None:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     run_id = uuid4().hex[:12]
+    run_dir = OUT_DIR / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
     stem = input_path.stem[:60]
     params = {key: getattr(args, key) for key in (
         "steps", "passes", "seed", "restore", "restore_sigma", "restore_mode", "unsharp", "keep_intermediate",
     )}
     manifest = {
-        "schema_version": 1, "run_id": run_id,
+        "schema_version": 1, "run_id": run_id, "sampling": "linear-sigma-v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": dict(path=str(input_path), name=input_path.name, width=original.width, height=original.height),
         "working_size": list(image.size), "params": params,
@@ -441,7 +500,7 @@ def main() -> None:
         "runtime": dict(device=DEVICE, precision=str(COMPUTE_DTYPE), offload="auto"),
         "outputs": [],
     }
-    manifest_path = OUT_DIR / f"{stem}_desynth_{run_id}.json"
+    manifest_path = run_dir / f"{stem}_desynth_{run_id}.json"
 
     def save_result(clean_pil, denoise, index, model_path):
         # Readable parameter tags plus a run ID and sweep index prevent both
@@ -455,19 +514,23 @@ def main() -> None:
         if not args.restore:
             tag += "_norestore"
         prefix = f"{stem}_desynth_{tag}_{run_id}_{index:02d}"
-        final_path = OUT_DIR / f"{prefix}.png"
-        finish_image(clean_pil, original, params, _restore).save(final_path)
+        final_path = run_dir / f"{prefix}.png"
+        finished = finish_image(clean_pil, original, params, _restore)
+        finished.save(final_path)
         print(f"  -> {final_path}")
         mid_path = None
         if args.restore and args.keep_intermediate:
-            mid_path = OUT_DIR / f"{prefix}_clean.png"
+            mid_path = run_dir / f"{prefix}_clean.png"
             finish_image(clean_pil, original, {**params, "restore": False}, _restore).save(mid_path)
             print(f"  -> {mid_path}  (intermediate)")
-        manifest["outputs"].append(dict(
+        record = dict(
             kind="result", path=str(final_path.resolve()), name=final_path.name, denoise=denoise,
+            starting_sigma=denoise,
             effective_steps=effective_img2img_steps(args.steps, denoise),
             clean_path=str(mid_path.resolve()) if mid_path else None,
-        ))
+        )
+        record.update(export_reference_result(final_path, input_path, params, denoise))
+        manifest["outputs"].append(record)
         temporary = manifest_path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         temporary.replace(manifest_path)

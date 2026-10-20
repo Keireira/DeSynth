@@ -5,7 +5,18 @@ __pycache__/
 *.py[cod]
 .cache/
 
-# Large downloaded model weights and generated images.
+# Large downloaded model weights.
 *.gguf
 *.safetensors
-out/
+
+# Keep reference results from original.png; ignore other outputs and caches.
+/out/*
+!/out/[Oo]riginal_desynth_s[0-9]*.png
+!/out/comparison_[Oo]riginal_desynth_s[0-9]*.png
+/out/*_d0.125_*.png
+/out/*_clean.png
+
+# Detail comparisons of original.png and its reference results.
+!/out/detail_run/
+/out/detail_run/*
+!/out/detail_run/modes_d0.250.png

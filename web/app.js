@@ -993,18 +993,29 @@ async function initialize() {
     setText("model-label", session.models?.[0]?.name || "No models found");
     const activeJob = session.active_job_id ? await api(`/api/job/${session.active_job_id}`) : null;
     const source = session.assets?.find((asset) => asset.id === (activeJob?.source_id || selection.source)) || session.assets?.find((asset) => asset.id === session.default_source_id);
-    const result = session.assets?.find((asset) => asset.id === selection.result) || (!activeJob && source?.id === session.default_source_id ? session.assets?.find((asset) => asset.id === session.default_result_id) : null);
+    const result = !activeJob ? session.assets?.find((asset) => asset.id === selection.result) || (source?.id === session.default_source_id ? session.assets?.find((asset) => asset.id === session.default_result_id) : null) : null;
     const clean = session.assets?.find((asset) => asset.id === selection.clean && asset.kind === "clean") || null;
     if (source) {
       await useSource(source);
-      if (result && result.width === source.width && result.height === source.height) { await useResult(result, null, clean); setMode("split"); }
+      if (result && result.width === source.width && result.height === source.height) {
+        await useResult(result, null, clean);
+        setMode("split");
+        // Settings are saved before the debounced restoration completes. A
+        // reload can therefore recover newer controls with an older result.
+        // Rebuild from the clean image before allowing that result to export.
+        scheduleRestore();
+      }
     }
     if (!session.ready) toast("Run make setup to enable processing. Image comparison is available.");
     if (activeJob) {
       busy(true);
-      try { await watchJob(activeJob.id); }
+      let completed = false;
+      try { await watchJob(activeJob.id); completed = true; }
       catch (error) { toast(error.message, true); setText("live-status", `Error: ${error.message}`); }
       finally { busy(false); }
+      // A reconnected job may have started with restoration settings from a
+      // different tab. Apply this tab's controls to its newly generated clean.
+      if (completed && state.source?.id === activeJob.source_id) scheduleRestore();
     }
   } catch (error) { setText("live-status", "Cannot connect to the local server."); toast(error.message, true); }
 }

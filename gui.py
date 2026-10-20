@@ -23,11 +23,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
+from PIL.PngImagePlugin import PngInfo
 from model_catalog import (automatic_model_paths, default_steps_for_lightning,
                            discover_adapters, discover_models, effective_img2img_steps,
                            embeddings_path, lightning_steps)
-from processing import finish_image, prepare_image
+from processing import finish_image, normalize_rgba, oriented_size, prepare_image, srgb_profile_bytes
 
 ROOT = Path(__file__).resolve().parent
 STORE = ROOT / "out" / "gui"
@@ -183,7 +184,7 @@ class Studio:
         for path in candidates:
             try:
                 with Image.open(path) as image:
-                    if image.size == (original["width"], original["height"]):
+                    if oriented_size(image) == (original["width"], original["height"]):
                         valid.append((path.stat().st_mtime_ns, path))
             except (OSError, ValueError, Image.DecompressionBombError):
                 continue
@@ -281,7 +282,7 @@ class Studio:
 
     def register(self, path, kind, name=None, *, temporary=False):
         with Image.open(path) as image:
-            width, height = image.size
+            width, height = oriented_size(image)
             if width * height > MAX_PIXELS:
                 raise ValueError("Image is too large. Maximum: 36 megapixels.")
         asset_id = secrets.token_hex(16)
@@ -307,18 +308,32 @@ class Studio:
         with self.lock:
             self.asset(asset_id)
             with Image.open(self.paths[asset_id]) as image:
-                return ImageOps.exif_transpose(image).convert("RGBA")
+                return normalize_rgba(image)
 
     def image_bytes(self, asset_id):
         with self.lock:
             self.asset(asset_id)
-            return self.paths[asset_id].read_bytes()
+            path = self.paths[asset_id]
+            with Image.open(path) as image:
+                profile = image.info.get("icc_profile")
+                if (image.getexif().get(274) in (2, 3, 4, 5, 6, 7, 8)
+                        or profile is not None and profile != srgb_profile_bytes()):
+                    # Registered originals may predate upload normalization.
+                    # Display exactly the same sRGB pixels used by metrics/diff.
+                    data = io.BytesIO()
+                    normalize_rgba(image).save(data, format="PNG")
+                    return data.getvalue()
+            return path.read_bytes()
 
-    def save(self, image, kind, name, *, temporary=False):
+    def save(self, image, kind, name, *, temporary=False, metadata=None):
         directory = STORE / "temporary" if temporary else STORE
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{secrets.token_hex(16)}.png"
-        image.save(path, format="PNG")
+        pnginfo = None
+        if metadata is not None:
+            pnginfo = PngInfo()
+            pnginfo.add_text("desynth", json.dumps(metadata, ensure_ascii=True))
+        image.save(path, format="PNG", pnginfo=pnginfo)
         try:
             return self.register(path, kind, name, temporary=temporary)
         except Exception:
@@ -403,7 +418,9 @@ class Studio:
             with Image.open(io.BytesIO(decoded)) as source:
                 if source.width * source.height > MAX_PIXELS:
                     raise APIError("Image is too large. Maximum: 36 megapixels.", 413)
-                image = ImageOps.exif_transpose(source).convert("RGBA")
+                image = normalize_rgba(source)
+        except ValueError as exc:
+            raise APIError(str(exc)) from exc
         except (binascii.Error, OSError, UnidentifiedImageError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
             raise APIError("Cannot read this image. Use PNG, JPEG or WebP up to 36 megapixels.") from exc
         name = payload.get("name", "image.png")
@@ -544,7 +561,16 @@ class Studio:
                             if not self.restore_obsolete(ticket):
                                 metrics = self.compare_images(original, image)
                                 if not self.restore_obsolete(ticket):
-                                    asset = self.save(image, "result", "desynth_restored.png", temporary=True)
+                                    try:
+                                        metadata = json.loads(clean.info.get("desynth", "{}"))
+                                    except (ValueError, TypeError):
+                                        metadata = {}
+                                    if not isinstance(metadata, dict):
+                                        metadata = {}
+                                    recorded = metadata.get("params", {})
+                                    metadata["params"] = {**(recorded if isinstance(recorded, dict) else {}), **ticket["params"]}
+                                    asset = self.save(image, "result", "desynth_restored.png", temporary=True,
+                                                      metadata=metadata)
                                     with self.lock:
                                         if self.restore_obsolete(ticket):
                                             self.forget_asset(asset["id"])
@@ -595,6 +621,7 @@ class Studio:
                        seed=params["seed"], source_id=source_id, result=None, clean=None, metrics=None, error=None)
             job.update(runtime=runtime, requested_runtime={key: params[key] for key in ("device", "offload", "precision")})
             job.update(lightning=params["lightning"], lightning_scale=params["lightning_scale"], steps=params["steps"])
+            job.update(denoise=params["denoise"], starting_sigma=params["denoise"], sampling="linear-sigma-v1")
             self.jobs[job_id] = job
             self.started[job_id] = time.monotonic()
             self.active = job_id
@@ -675,8 +702,14 @@ class Studio:
                 # self.pipe is cleared. Leave its exception scope first.
                 self.drop_pipeline(force=True)
             update(stage="Restoring details", progress=90)
+            metadata = dict(
+                sampling="linear-sigma-v1", starting_sigma=params["denoise"],
+                params={key: value for key, value in params.items() if not key.startswith("_")},
+                transformer=self.pipe_path, runtime=runtime, working_size=list(image.size),
+                source_name=self.assets[source_id]["name"],
+            )
             clean_asset = self.save(clean.convert("RGBA"), "clean", "desynth_clean.png",
-                                    temporary=not params["keep_intermediate"])
+                                    temporary=not params["keep_intermediate"], metadata=metadata)
             with self.lock:
                 self.clean_sources[clean_asset["id"]] = source_id
                 update(clean=clean_asset)
@@ -684,7 +717,8 @@ class Studio:
                 final = self.restore_image(clean, original, params)
                 update(stage="Comparing RGBA channels", progress=95)
                 metrics = self.compare_images(original, final)
-            result = self.save(final, "result", f"{Path(self.assets[source_id]['name']).stem}_desynth_seed{params['seed']}.png")
+            result = self.save(final, "result", f"{Path(self.assets[source_id]['name']).stem}_desynth_seed{params['seed']}.png",
+                               metadata=metadata)
             update(result=result)
             update(status="done", stage="Done", progress=100, metrics=metrics)
             with self.lock:

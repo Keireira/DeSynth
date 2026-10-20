@@ -26,7 +26,7 @@ const asset = (id, width = 2, height = 1) => ({ id, name: `${id}.png`, url: `/ap
 function fixture() {
   const nodes = {};
   const readers = [], images = [], calls = [], workers = [], timers = new Map(), downloads = [], canvases = [];
-  const responses = new Map();
+  const responses = new Map(), storage = new Map();
   let timerId = 0;
   const node = (id) => nodes[id] ||= {
     value: "", checked: false, hidden: false, disabled: false, textContent: "", dataset: {}, style: {},
@@ -57,7 +57,7 @@ function fixture() {
   const context = vm.createContext({
     console, crypto: { randomUUID }, AbortController, Image: FakeImage, FileReader: FakeReader, Worker: FakeWorker,
     Uint8ClampedArray, ImageData: class { constructor(data, width, height) { Object.assign(this, { data, width, height }); } },
-    localStorage: { setItem() {}, getItem: () => null },
+    localStorage: { setItem: (key, value) => storage.set(key, value), getItem: (key) => storage.get(key) ?? null },
     requestAnimationFrame: () => 0, cancelAnimationFrame() {},
     setTimeout(callback, delay) { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -94,7 +94,7 @@ function fixture() {
     state.result = ${JSON.stringify(asset("result"))};
     state.resultImage = {naturalWidth:2,naturalHeight:1};
     state.clean = ${JSON.stringify(asset("clean"))};`);
-  return { run, nodes, node, readers, images, calls, workers, timers, downloads, canvases, responses };
+  return { run, nodes, node, readers, images, calls, workers, timers, downloads, canvases, responses, storage };
 }
 
 function workerFixture(buffers) {
@@ -199,6 +199,77 @@ test("superseded restore responses are normal cancellation, not image load error
   assert.equal(f.images.length, 0);
   assert.equal(f.node("toast").textContent, "");
   assert.equal(f.run("state.restoring"), false);
+});
+
+function prepareReload(f, activeJob = null) {
+  f.storage.set("desynth.settings.v1", JSON.stringify({ restore: false, restore_sigma: 2.5 }));
+  f.storage.set("desynth.selection.v1", JSON.stringify({ source: "old", result: "result", clean: "clean" }));
+  f.run(`bindEvents = () => {}; renderPresets = () => {};
+    state.source = state.sourceImage = state.result = state.resultImage = state.clean = null;`);
+  const session = {
+    ready: true, runtime: { ready: true }, models: [], lightning_adapters: [],
+    assets: [{ ...asset("old"), kind: "source" }, { ...asset("result"), kind: "result" }, { ...asset("clean"), kind: "clean" }],
+    default_source_id: "old", default_result_id: "result", active_job_id: activeJob?.id,
+  };
+  f.responses.set("/api/state", { promise: Promise.resolve(session) });
+  if (activeJob) f.responses.set(`/api/job/${activeJob.id}`, { promise: Promise.resolve(activeJob) });
+}
+
+test("reload reapplies saved restoration controls before an old result can export", async () => {
+  const f = fixture();
+  prepareReload(f);
+  const restoreResponse = deferred();
+  f.responses.set("/api/restore", restoreResponse);
+  const initializing = f.run("initialize()");
+  await until(() => f.images.length === 1);
+  f.images[0].finish();
+  await until(() => f.images.length === 2);
+  f.images[1].finish();
+  await initializing;
+  assert.equal(f.node("restore").checked, false);
+  assert.equal(Number(f.node("sigma").value), 2.5);
+  assert.equal(f.run("state.restoring"), true);
+  assert.equal(f.node("export-button").disabled, true);
+  await f.run("download()");
+  assert.equal(f.downloads.length, 0, "stale restored pixels cannot export with restoration switched off");
+  const restoring = [...f.timers.values()].find((timer) => timer.delay === 300).callback();
+  const request = f.calls.find((call) => call.url === "/api/restore").body;
+  assert.equal(request.source_id, "old");
+  assert.equal(request.clean_id, "clean");
+  assert.equal(request.params.restore, false);
+  assert.equal(request.params.restore_sigma, 2.5);
+  assert.ok(!f.calls.some((call) => call.url === "/api/process"), "reload does not start diffusion");
+  restoreResponse.resolve({ result: asset("reconciled"), metrics: {} });
+  await until(() => f.images.length === 3);
+  f.images[2].finish();
+  await restoring;
+  assert.equal(f.run("state.result.id"), "reconciled");
+  assert.equal(f.run("state.restoring"), false);
+  assert.equal(f.node("export-button").disabled, false);
+});
+
+test("reconnecting to a job restores its new clean image using this tab's controls", async () => {
+  const f = fixture();
+  prepareReload(f, { id: "job", source_id: "old", status: "done", result: asset("job-result"), clean: asset("job-clean"), metrics: {} });
+  const initializing = f.run("initialize()");
+  await until(() => f.images.length === 1);
+  f.images[0].finish();
+  await until(() => f.images.length === 2);
+  assert.equal(f.images[1].url, "/api/image/job-result", "an older selection is not shown over the active job's source");
+  assert.ok(!f.calls.some((call) => call.url === "/api/restore"));
+  f.images[1].finish();
+  await initializing;
+  assert.equal(f.run("state.clean.id"), "job-clean");
+  assert.equal(f.run("state.restoring"), true);
+  assert.equal(f.node("export-button").disabled, true);
+  const response = deferred();
+  f.responses.set("/api/restore", response);
+  const restoring = [...f.timers.values()].find((timer) => timer.delay === 300).callback();
+  const request = f.calls.find((call) => call.url === "/api/restore").body;
+  assert.equal(request.clean_id, "job-clean");
+  assert.equal(request.params.restore, false);
+  response.resolve({ superseded: true });
+  await restoring;
 });
 
 test("worker preserves hidden RGB and alpha differences with gain and opaque output", async () => {
