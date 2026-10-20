@@ -412,7 +412,7 @@ class GuiHTTPTests(unittest.TestCase):
                     self.assertEqual(finished["runtime"]["offload"], offload)
                     self.assertEqual(finished["runtime"]["precision"], precision)
         load.assert_called_once()
-        self.assertEqual(free.call_count, 4)
+        self.assertEqual(free.call_count, 6)
         for key in original_dtypes:
             tensor = cached[key]
             self.assertEqual(tensor.device, "cpu")

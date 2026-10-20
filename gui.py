@@ -10,6 +10,7 @@ import io
 import ipaddress
 import json
 import math
+import re
 import secrets
 import socket
 import subprocess
@@ -33,6 +34,52 @@ MAX_PIXELS = 36_000_000
 Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 
 
+def model_inventory(root):
+    """Find local weights in ai/, retaining legacy files in the project root."""
+    found = {}
+    for directory in (root / "ai", root):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and path.stat().st_size > 0 and path.name.lower() not in found:
+                found[path.name.lower()] = path
+    models, adapters = [], []
+    for path in found.values():
+        item = {"name": path.name, "path": path.relative_to(root).as_posix()}
+        if path.suffix.lower() == ".gguf":
+            models.append(item)
+        elif path.suffix.lower() == ".safetensors" and "qwen-image-2512-lightning-" in path.name.lower():
+            match = re.search(r"-(4|8)steps-", path.name, re.IGNORECASE)
+            if match:
+                steps = int(match.group(1))
+                precision = "FP32" if "fp32" in path.name.lower() else "BF16" if "bf16" in path.name.lower() else ""
+                adapters.append({**item, "steps": steps, "label": f"{steps} steps" + (f" · {precision}" if precision else "")})
+    models.sort(key=lambda item: ("Q4" not in item["name"].upper(), item["name"]))
+    adapters.sort(key=lambda item: (item["steps"] != 8, "fp32" not in item["name"].lower(), item["name"]))
+    return models, adapters
+
+
+def embeddings_path(root):
+    return next((path for path in (root / "ai" / "embeds_cache.pt", root / "embeds_cache.pt") if path.is_file()), root / "ai" / "embeds_cache.pt")
+
+
+def weight_identity(path):
+    """Replacing a weight file at the same path must reload the pipeline."""
+    info = path.stat()
+    return str(path.resolve()), info.st_size, info.st_mtime_ns
+
+
+def automatic_model_paths(models, root):
+    """Keep the preferred model first; OOM retries only use smaller weight files."""
+    if not models:
+        return []
+    preferred = models[0]["path"]
+    preferred_size = (root / preferred).stat().st_size
+    smaller = [(item["path"], (root / item["path"]).stat().st_size) for item in models[1:]]
+    return [preferred] + [path for path, size in sorted(smaller, key=lambda item: item[1], reverse=True)
+                          if size < preferred_size]
+
+
 class APIError(Exception):
     def __init__(self, message, status=400):
         self.status = status
@@ -47,7 +94,7 @@ def number(value, name, low, high, integer=False):
     return int(value) if integer else float(value)
 
 
-def parameters(raw, process=False):
+def parameters(raw, process=False, default_steps=8):
     if not isinstance(raw, dict):
         raise APIError("params must be an object.")
     result = {
@@ -63,12 +110,14 @@ def parameters(raw, process=False):
     if process:
         result.update(
             denoise=number(raw.get("denoise", .25), "denoise", .01, 1),
-            steps=number(raw.get("steps", 8), "steps", 1, 64, True),
+            steps=number(raw.get("steps", default_steps), "steps", 1, 64, True),
             passes=number(raw.get("passes", 1), "passes", 1, 8, True),
             seed=raw.get("seed"), transformer=raw.get("transformer"),
             preview=raw.get("preview", False), keep_intermediate=raw.get("keep_intermediate", False),
             device=raw.get("device", "auto"), offload=raw.get("offload", "auto"),
             precision=raw.get("precision", "auto"),
+            lightning=raw.get("lightning"),
+            lightning_scale=number(raw.get("lightning_scale", .8), "lightning_scale", .01, 2),
         )
         device = result["device"]
         if not isinstance(device, str) or not (device in ("auto", "cpu", "mps") or device.startswith("cuda:") and device[5:].isdigit()):
@@ -108,7 +157,9 @@ class Studio:
         self.device = "Detecting device…"
         self.runtime = {"ready": False, "devices": [{"id": "cpu", "name": "CPU", "type": "cpu",
                          "precisions": ["float32"], "offload_modes": ["none"]}], "default_device": "cpu"}
-        self.models = [{"name": p.name, "path": p.name} for p in sorted(ROOT.glob("*.gguf"), key=lambda p: ("Q4" not in p.name.upper(), p.name)) if p.is_file()]
+        self.models, self.lightning_adapters = model_inventory(ROOT)
+        self.default_lightning = self.lightning_adapters[0]["path"] if self.lightning_adapters else None
+        self.default_steps = 32 if self.lightning_adapters and self.lightning_adapters[0]["steps"] == 8 else 8
         self.default_source = self.default_result = None
         originals = sorted(p for p in ROOT.iterdir() if p.name.lower() == "original.png")
         if originals:
@@ -213,12 +264,15 @@ class Studio:
         return self.register(path, kind, name)
 
     def state(self):
-        missing = [name for name in ("embeds_cache.pt", "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors") if not (ROOT / name).is_file()]
+        missing = [] if embeddings_path(ROOT).is_file() else ["embeds_cache.pt"]
         if not self.models:
             missing.append("GGUF transformer")
+        if not self.lightning_adapters:
+            missing.append("Lightning adapter")
         missing += [name for name in ("torch", "diffusers", "numpy", "cv2", "skimage") if importlib.util.find_spec(name) is None]
         with self.lock:
-            return dict(device=self.device, ready=not missing, models=self.models, assets=list(self.assets.values()),
+            return dict(device=self.device, ready=not missing, models=self.models, lightning_adapters=self.lightning_adapters,
+                        default_lightning=self.default_lightning, default_steps=self.default_steps, assets=list(self.assets.values()),
                         default_source_id=self.default_source, default_result_id=self.default_result,
                         missing=missing, active_job_id=self.active, runtime=self.runtime)
 
@@ -294,13 +348,23 @@ class Studio:
     def process(self, payload):
         source_id = payload.get("source_id")
         self.asset(source_id, "source")
-        params = parameters(payload.get("params", {}), process=True)
+        raw_params = payload.get("params", {})
+        preferred = next((item for item in self.lightning_adapters if isinstance(raw_params, dict) and item["path"] == raw_params.get("lightning")), None)
+        default_steps = (32 if preferred["steps"] == 8 else 8) if preferred else self.default_steps
+        params = parameters(raw_params, process=True, default_steps=default_steps)
+        runtime = self.resolve_runtime(params)
         requested = params["transformer"]
         if requested is not None and requested not in [model["path"] for model in self.models]:
             raise APIError("Select a GGUF model from the available models.")
+        adapter = params["lightning"] if params["lightning"] is not None else self.default_lightning
+        selected = next((item for item in self.lightning_adapters if item["path"] == adapter), None)
+        if selected is None:
+            raise APIError("Select a Lightning adapter from the available adapters.")
+        if not (ROOT / selected["path"]).is_file():
+            raise APIError("The selected Lightning adapter was moved or removed. Restart the server to refresh available models.")
+        params["lightning"] = selected["path"]
         if not self.state()["ready"]:
-            raise APIError("Environment is not ready. Run make setup and make models; check embeds_cache.pt.", 503)
-        runtime = self.resolve_runtime(params)
+            raise APIError("Environment is not ready. Run make setup; check GGUF and Lightning weights in ai/ and embeds_cache.pt.", 503)
         if params["seed"] is None:
             params["seed"] = secrets.randbits(31)
         job_id = secrets.token_hex(16)
@@ -310,6 +374,7 @@ class Studio:
             job = dict(id=job_id, status="queued", progress=0, stage="Queued", elapsed=0,
                        seed=params["seed"], source_id=source_id, result=None, clean=None, metrics=None, error=None)
             job.update(runtime=runtime, requested_runtime={key: params[key] for key in ("device", "offload", "precision")})
+            job.update(lightning=params["lightning"], lightning_scale=params["lightning_scale"], steps=params["steps"])
             self.jobs[job_id] = job
             self.started[job_id] = time.monotonic()
             self.active = job_id
@@ -341,23 +406,25 @@ class Studio:
                 image = image.resize(work_size, Image.Resampling.LANCZOS)
             update(preview_size=list(image.size), stage="Loading embeddings", progress=5)
             if self.embeds is None:
-                self.embeds = ds.torch.load(ds.EMBEDS_CACHE, map_location="cpu", weights_only=False)
+                self.embeds = ds.torch.load(embeddings_path(ROOT), map_location="cpu", weights_only=False)
             # Cached embeddings stay on CPU. Each job gets the selected precision
             # and device, including masks needed when no offload hooks are active.
             embeds = {}
             for key in ("prompt_embeds", "negative_prompt_embeds", "prompt_embeds_mask", "negative_prompt_embeds_mask"):
                 value = self.embeds[key]
                 embeds[key] = value.to(device=runtime["device"], dtype=dtype if value.is_floating_point() else value.dtype)
-            candidates = [params["transformer"]] if params["transformer"] else [m["path"] for m in self.models]
+            candidates = [params["transformer"]] if params["transformer"] else automatic_model_paths(self.models, ROOT)
             clean = None
             for candidate in candidates:
                 try:
-                    pipe_key = (candidate, runtime["device"], runtime["offload"], runtime["precision"])
+                    pipe_key = (weight_identity(ROOT / candidate), weight_identity(ROOT / params["lightning"]),
+                                params["lightning_scale"], runtime["device"], runtime["offload"], runtime["precision"])
                     if self.pipe_key != pipe_key or self.pipe is None:
                         self.drop_pipeline()
                         update(stage=f"Loading {candidate} (first run takes longer)", progress=7)
                         self.pipe = ds.build_pipeline(ROOT / candidate, device=runtime["device"],
-                                                      offload=runtime["offload"], compute_dtype=dtype)
+                                                      offload=runtime["offload"], compute_dtype=dtype,
+                                                      lightning_lora=ROOT / params["lightning"], lightning_scale=params["lightning_scale"])
                         self.pipe_path = candidate
                         self.pipe_key = pipe_key
                     current = image
