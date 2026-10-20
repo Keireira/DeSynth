@@ -1,0 +1,11 @@
+.venv
+
+# Python bytecode and model download metadata.
+__pycache__/
+*.py[cod]
+.cache/
+
+# Large downloaded model weights and generated images.
+*.gguf
+*.safetensors
+out/

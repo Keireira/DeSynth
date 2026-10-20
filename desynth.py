@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
+import re
 import warnings
 from pathlib import Path
 
@@ -79,25 +81,31 @@ _patch_gguf_param()
 
 from diffusers import (
     AutoencoderKLQwenImage,
+    FlowMatchEulerDiscreteScheduler,
     GGUFQuantizationConfig,
     QwenImageImg2ImgPipeline,
     QwenImageTransformer2DModel,
 )
 from diffusers.utils import load_image
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent
+AI_DIR = ROOT / "ai"
 DEFAULT_INPUT = ROOT / "Original.png"
 OUT_DIR = ROOT / "out"
 
-# Ordered list of GGUF quants to try, best quality first.
+# Keep the memory-tested Q4 default; larger quants remain an explicit choice.
 # Each entry is (label, [candidate paths]) — first existing path wins per entry.
 # On OOM the pipeline tears down and retries with the next entry automatically.
 GGUF_FALLBACK_CHAIN: list[tuple[str, list[Path]]] = [
     ("Q4_K_M (~13 GB)", [
+        AI_DIR / "Qwen-Image-2512-Q4_K_M.gguf",
+        AI_DIR / "qwen-image-2512-Q4_K_M.gguf",
         ROOT / "Qwen-Image-2512-Q4_K_M.gguf",
         ROOT / "qwen-image-2512-Q4_K_M.gguf",   # README-suggested lowercase
     ]),
     ("Q2_K_M (~7 GB)", [
+        AI_DIR / "Qwen-Image-2512-Q2_K_M.gguf",
+        AI_DIR / "qwen-image-2512-Q2_K_M.gguf",
         ROOT / "Qwen-Image-2512-Q2_K_M.gguf",
         ROOT / "qwen-image-2512-Q2_K_M.gguf",
     ]),
@@ -105,15 +113,75 @@ GGUF_FALLBACK_CHAIN: list[tuple[str, list[Path]]] = [
 
 def _resolve_gguf(candidates: list[Path]) -> Path | None:
     """Return the first path in candidates that exists on disk, or None."""
-    return next((p for p in candidates if p.exists()), None)
+    return next((p for p in candidates if _nonempty_file(p)), None)
+
+
+def _nonempty_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def resolve_model_path(path: str | Path) -> Path:
+    """Resolve bare model filenames in ai/ first, retaining legacy root files."""
+    path = Path(path).expanduser()
+    if path.is_absolute():
+        return path
+    if len(path.parts) == 1:
+        return next((base / path for base in (AI_DIR, ROOT) if _nonempty_file(base / path)), AI_DIR / path)
+    return path.resolve() if path.is_file() else ROOT / path
+
+
+def discover_gguf_models() -> list[Path]:
+    """Find all local GGUFs, preferring ai/ when a filename exists twice."""
+    paths: dict[str, Path] = {}
+    for base in (AI_DIR, ROOT):
+        for path in sorted(base.glob("*.gguf")):
+            if _nonempty_file(path):
+                paths.setdefault(path.name.lower(), path)
+    return sorted(paths.values(), key=lambda p: (
+        0 if "q4_k_m" in p.name.lower() else 1 if "q2_k_m" in p.name.lower() else 2,
+        p.parent != AI_DIR, p.name.lower(),
+    ))
+
+
+def discover_lightning_loras() -> list[Path]:
+    """List local Qwen-Image-2512 Lightning adapters, newest step profile first."""
+    paths: dict[str, Path] = {}
+    for base in (AI_DIR, ROOT):
+        for path in sorted(base.glob("*.safetensors")):
+            if (_nonempty_file(path) and "qwen-image-2512-lightning-" in path.name.lower()
+                    and lightning_steps(path) in (4, 8)):
+                paths.setdefault(path.name.lower(), path)
+    return sorted(paths.values(), key=lambda p: (
+        lightning_steps(p) != 8, "fp32" not in p.name.lower(), p.parent != AI_DIR, p.name.lower(),
+    ))
+
+
+def lightning_steps(path: str | Path) -> int | None:
+    """Return the advertised training profile, not the img2img step count."""
+    match = re.search(r"-(4|8)steps(?:-|\.|$)", Path(path).name, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def default_steps_for_lightning(path: str | Path) -> int:
+    """Total schedule at default strength: 8 actual steps for the 8-step LoRA."""
+    return 32 if lightning_steps(path) == 8 else 8
+
+
+def effective_img2img_steps(steps: int, denoise: float) -> int:
+    """Match QwenImageImg2ImgPipeline.get_timesteps, including its rounding."""
+    initial = min(steps * denoise, steps)
+    return steps - int(max(steps - initial, 0))
 
 # Default transformer = best available quant right now (used by --transformer default).
 GGUF_TRANSFORMER = next(
-    (p for _, cands in GGUF_FALLBACK_CHAIN for p in cands if p.exists()),
-    GGUF_FALLBACK_CHAIN[0][1][0],  # fallback to first path even if missing (gives clear error)
+    (p for _, cands in GGUF_FALLBACK_CHAIN for p in cands if _nonempty_file(p)),
+    next(iter(discover_gguf_models()), GGUF_FALLBACK_CHAIN[0][1][0]),
 )
-LIGHTNING_LORA = ROOT / "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors"
-EMBEDS_CACHE = ROOT / "embeds_cache.pt"
+LIGHTNING_LORA = next(iter(discover_lightning_loras()),
+                      AI_DIR / "Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors")
+DEFAULT_LIGHTNING_SCALE = 0.8
+EMBEDS_CACHE = next((base / "embeds_cache.pt" for base in (AI_DIR, ROOT)
+                    if _nonempty_file(base / "embeds_cache.pt")), ROOT / "embeds_cache.pt")
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -141,10 +209,12 @@ def _free_pipeline(pipe) -> None:
 # HF repo used only for tiny configs and the ~250MB VAE.
 QWEN_IMAGE_REPO = "Qwen/Qwen-Image"
 
-# Lightning is a 4-step LoRA. We run at 8 steps so denoise quantizes to 1/8;
-# 2/8 = 0.25 is the minimum that defeats SynthID. Lower = no-op (input passes
-# through). Higher = more drift, no extra benefit.
-DEFAULT_STEPS = 8
+# Img2img slices the total schedule according to denoise (see the effective
+# step helper above for the pipeline's rounding). The 8-step adapter
+# therefore defaults to 32 total steps at strength 0.25. Keep the previous
+# 8-total-step profile when only the legacy 4-step adapter is available.
+# Explicit --steps values are always used as supplied.
+DEFAULT_STEPS = default_steps_for_lightning(LIGHTNING_LORA)
 CFG = 1.0
 DEFAULT_DENOISE = 0.25
 # SynthID's spatial cutoff is at ~2px. 1.95 is the safe ceiling that takes
@@ -174,14 +244,44 @@ else:
 print(f"[device] {DEVICE}  dtype={COMPUTE_DTYPE}")
 
 
-def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2ImgPipeline:
-    for p in (transformer_path, LIGHTNING_LORA, EMBEDS_CACHE):
-        if not p.exists():
+def _place_pipeline(pipe, device: str, offload: str = "auto") -> None:
+    """Place a new pipeline without changing the CLI's process-wide defaults."""
+    target = torch.device(device)
+    if offload == "auto":
+        offload = "sequential" if target.type == "cuda" else "model" if target.type == "mps" else "none"
+    if offload not in ("none", "sequential", "model"):
+        raise ValueError(f"Unsupported offload mode: {offload}")
+    if target.type == "cpu" and offload != "none":
+        raise ValueError("CPU processing requires offload=none.")
+    if target.type == "mps" and offload == "sequential":
+        raise ValueError("Sequential offload is not supported on MPS. Choose model or none.")
+    if offload == "none":
+        pipe.to(str(target))
+    elif target.type == "cuda":
+        method = pipe.enable_sequential_cpu_offload if offload == "sequential" else pipe.enable_model_cpu_offload
+        method(gpu_id=target.index if target.index is not None else 0, device="cuda")
+    else:
+        pipe.enable_model_cpu_offload(device=target.type)
+
+
+def build_pipeline(
+    transformer_path: Path = GGUF_TRANSFORMER, *, device: str | None = None,
+    offload: str = "auto", compute_dtype: torch.dtype | None = None,
+    lightning_lora: Path | None = None, lightning_scale: float = DEFAULT_LIGHTNING_SCALE,
+) -> QwenImageImg2ImgPipeline:
+    transformer_path = resolve_model_path(transformer_path)
+    lightning_lora = resolve_model_path(lightning_lora or LIGHTNING_LORA)
+    if not math.isfinite(lightning_scale) or lightning_scale <= 0:
+        raise ValueError("Lightning scale must be a finite number greater than zero.")
+    target = torch.device(device or DEVICE)
+    dtype = compute_dtype or (torch.float32 if target.type == "cpu" else COMPUTE_DTYPE)
+    if target.type == "cpu" and dtype != torch.float32:
+        raise ValueError("CPU processing requires float32 precision.")
+    for p in (transformer_path, lightning_lora, EMBEDS_CACHE):
+        if not _nonempty_file(p):
             raise FileNotFoundError(
                 f"{p}\n(Run `python precompute_embeds.py` first if embeds_cache.pt is missing.)"
             )
-
-    dtype = COMPUTE_DTYPE
 
     # Offline if cached; download once if not.
     def _load(loader, **kwargs):
@@ -207,6 +307,26 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
         dtype=dtype,
     )
 
+    # Both Lightning profiles are distilled with shift=3. Match their official
+    # FlowMatch schedule, including disabling the base model's terminal shift.
+    # https://github.com/ModelTC/LightX2V-Qwen-Image-Lightning/blob/main/generate_with_diffusers.py
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config({
+        "base_image_seq_len": 256,
+        "base_shift": math.log(3),
+        "invert_sigmas": False,
+        "max_image_seq_len": 8192,
+        "max_shift": math.log(3),
+        "num_train_timesteps": 1000,
+        "shift": 1.0,
+        "shift_terminal": None,
+        "stochastic_sampling": False,
+        "time_shift_type": "exponential",
+        "use_beta_sigmas": False,
+        "use_dynamic_shifting": True,
+        "use_exponential_sigmas": False,
+        "use_karras_sigmas": False,
+    })
+
     # No text encoder loaded — embeds are precomputed.
     pipe = _load(
         QwenImageImg2ImgPipeline.from_pretrained,
@@ -215,6 +335,7 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
         vae=vae,
         text_encoder=None,
         tokenizer=None,
+        scheduler=scheduler,
         dtype=dtype,
     )
 
@@ -223,29 +344,15 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
     # the file by default; tensors are only paged into RAM when accessed.
     try:
         from safetensors.torch import load_file as _st_load
-        _lora_sd = _st_load(str(LIGHTNING_LORA), device="cpu")
+        _lora_sd = _st_load(str(lightning_lora), device="cpu")
         pipe.load_lora_weights(_lora_sd, adapter_name="lightning")
     except Exception:
         # Fallback: let diffusers handle it normally (heap allocation).
-        pipe.load_lora_weights(str(LIGHTNING_LORA), adapter_name="lightning")
-    pipe.set_adapters(["lightning"], adapter_weights=[0.8])
+        pipe.load_lora_weights(str(lightning_lora), adapter_name="lightning")
+    pipe.set_adapters(["lightning"], adapter_weights=[lightning_scale])
+    print(f"[lightning] {lightning_lora.name}  scale={lightning_scale:g}")
 
-    # Offload strategy depends on available hardware.
-    #   CUDA:     sequential offload — moves one layer at a time, fits 13GB GGUF
-    #             in 8 GB VRAM (tested config from the original author).
-    #   MPS/CPU:  model-level offload — accelerate moves whole sub-modules;
-    #             sequential offload's internals are CUDA-only in diffusers.
-    #             On CPU this still runs entirely in system RAM.
-    if DEVICE == "cuda":
-        pipe.enable_sequential_cpu_offload()
-    else:
-        # enable_model_cpu_offload falls back to CPU→device per sub-module,
-        # which accelerate supports on MPS as of accelerate>=0.26.
-        try:
-            pipe.enable_model_cpu_offload(device=DEVICE)
-        except TypeError:
-            # Older accelerate doesn't accept 'device' kwarg — move manually.
-            pipe.enable_model_cpu_offload()
+    _place_pipeline(pipe, str(target), offload)
     pipe.vae.enable_tiling()
 
     return pipe
@@ -304,8 +411,11 @@ def _restore(clean_pil, original_pil, *, sigma: float, mode: str = "gaussian", u
     return Image.fromarray(combined.astype("uint8"))
 
 
-def _sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int):
+def _sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int, callback_on_step_end=None, width=None, height=None):
     generator = torch.Generator(device="cpu").manual_seed(seed)
+    callbacks = {"callback_on_step_end": callback_on_step_end} if callback_on_step_end is not None else {}
+    if width is not None and height is not None:
+        callbacks.update(width=width, height=height)
     return pipe(
         image=image,
         prompt_embeds=embeds["prompt_embeds"].unsqueeze(0),
@@ -316,6 +426,7 @@ def _sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int):
         true_cfg_scale=CFG,
         strength=denoise,
         generator=generator,
+        **callbacks,
     ).images[0]
 
 
@@ -331,7 +442,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", nargs="?", default=str(DEFAULT_INPUT), help="input image path")
     parser.add_argument("--denoise", type=float, nargs="+", default=[DEFAULT_DENOISE], help="denoise strength(s)")
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="sampler steps")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="total img2img schedule steps; default 32 for 8-step Lightning, 8 for 4-step")
     parser.add_argument("--passes", type=int, default=1, help="sequential img2img passes")
     parser.add_argument("--seed", type=int, default=None, help="random per run if omitted")
     parser.add_argument("--restore-sigma", type=float, default=DEFAULT_RESTORE_SIGMA, help="freq-restore sigma; cliff at 2.0")
@@ -339,9 +451,30 @@ def main() -> None:
     parser.add_argument("--unsharp", type=float, default=0.0, help="post-restore sharpening; try 0.2 for perceptual lift")
     parser.add_argument("--no-restore", dest="restore", action="store_false", help="skip frequency restore")
     parser.add_argument("--keep-intermediate", action="store_true", help="also save the pre-restore output")
-    parser.add_argument("--transformer", type=Path, default=GGUF_TRANSFORMER, help="alt GGUF transformer path")
+    parser.add_argument("--transformer", type=Path, default=None, help="GGUF path; bare filenames resolve in ai/ first")
+    parser.add_argument("--lightning", type=Path, default=LIGHTNING_LORA,
+                        help="Lightning LoRA path; defaults to local 8-step adapter, then legacy 4-step")
+    parser.add_argument("--lightning-scale", type=float, default=DEFAULT_LIGHTNING_SCALE, help="Lightning LoRA strength (default 0.8)")
     parser.set_defaults(restore=True)
     args = parser.parse_args()
+
+    args.lightning = resolve_model_path(args.lightning)
+    if args.steps is None:
+        args.steps = default_steps_for_lightning(args.lightning)
+    if args.steps < 1:
+        parser.error("--steps must be at least 1")
+    if args.passes < 1:
+        parser.error("--passes must be at least 1")
+    if not math.isfinite(args.lightning_scale) or args.lightning_scale <= 0:
+        parser.error("--lightning-scale must be a finite number greater than zero")
+    if not _nonempty_file(args.lightning):
+        parser.error(f"Lightning adapter not found: {args.lightning}")
+    if any(not 0 < strength <= 1 for strength in args.denoise):
+        parser.error("--denoise values must be greater than zero and at most 1")
+    if any(effective_img2img_steps(args.steps, strength) < 1 for strength in args.denoise):
+        parser.error("--steps * --denoise must execute at least one denoising step")
+    print(f"[schedule] {args.steps} total steps; actual per pass: "
+          + ", ".join(f"{effective_img2img_steps(args.steps, strength)} at denoise={strength:g}" for strength in args.denoise))
 
     if args.seed is None:
         import secrets
@@ -362,8 +495,9 @@ def main() -> None:
 
     # Build the fallback sequence to attempt.
     # If --transformer was given explicitly, respect it and skip auto-fallback.
-    explicit_transformer = args.transformer != GGUF_TRANSFORMER
+    explicit_transformer = args.transformer is not None
     if explicit_transformer:
+        args.transformer = resolve_model_path(args.transformer)
         attempt_chain = [(args.transformer.stem, args.transformer)]
     else:
         # Walk GGUF_FALLBACK_CHAIN; skip entries whose file isn't on disk yet.
@@ -373,8 +507,10 @@ def main() -> None:
             if p is not None:
                 attempt_chain.append((label, p))
         if not attempt_chain:
+            attempt_chain = [(path.stem, path) for path in discover_gguf_models()]
+        if not attempt_chain:
             raise SystemExit(
-                "No GGUF transformer found. Download at least one quant:\n"
+                "No GGUF transformer found in ai/ or the project root. Download at least one quant:\n"
                 "  Qwen-Image-2512-Q4_K_M.gguf  (~13 GB, best quality)\n"
                 "  Qwen-Image-2512-Q2_K_M.gguf  (~7 GB,  fallback)\n"
                 "from https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF"
@@ -394,7 +530,8 @@ def main() -> None:
 
         print(f"[quant] trying {label}  ({transformer_path.name})")
         try:
-            pipe = build_pipeline(transformer_path=transformer_path)
+            pipe = build_pipeline(transformer_path=transformer_path,
+                                  lightning_lora=args.lightning, lightning_scale=args.lightning_scale)
             # Run a single denoise pass to confirm the quant fits in memory
             # before committing to the full sweep.
             _ = run_once(

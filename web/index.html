@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>DeSynth</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body data-busy="false">
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <defs>
+      <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m-4 4 4-4 4 4M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v12m-4-4 4 4 4-4M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+      <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5m6 0h5v5m0 6v5h-5m-6 0H4v-5"/></symbol>
+      <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 10a8 8 0 1 1 1 8M4 4v6h6"/></symbol>
+      <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 5 .5c0 1.5-2.5 2-2.5 3.5m0 3h.01"/></symbol>
+      <symbol id="i-dice" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M8 8h.01M16 8h.01M12 12h.01M8 16h.01M16 16h.01" stroke-width="3"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+      <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="8" cy="8" r="1.5"/><path d="m3 17 5-5 4 4 4-6 5 7"/></symbol>
+    </defs>
+  </svg>
+
+
+
+  <input id="file-input" type="file" accept="image/*" hidden>
+  <div class="app-shell">
+    <main class="workspace">
+      <section class="editor" aria-label="Image editor">
+        <section class="viewer-panel" id="drop-zone" aria-label="Image viewer. Drop an image here">
+          <div id="canvas-viewport" class="canvas-viewport">
+            <canvas id="comparison-canvas" aria-label="Image preview"></canvas>
+            <div class="empty-state" id="empty-state"><svg class="icon"><use href="#i-image"/></svg><strong>Open an image</strong><p>Drop a file here or use the image button.</p><span>PNG, JPG, WEBP · alpha supported</span></div>
+            <span id="before-label" class="canvas-label before-label" hidden>Original</span><span id="after-label" class="canvas-label after-label" hidden>Result</span>
+            <div id="divider" class="comparison-divider" hidden><button id="divider-handle" class="divider-handle" type="button" role="slider" tabindex="0" aria-label="Comparison divider position" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 8-4 4 4 4m8-8 4 4-4 4"/></svg></button></div>
+            <div class="drop-overlay"><strong>Drop to open image</strong></div>
+          </div>
+          <div class="viewer-toolbar">
+            <button id="upload-button" class="open-image-button" type="button" title="Open image" aria-label="Open image"><svg class="icon" aria-hidden="true"><use href="#i-image"/></svg><span>Open image</span></button>
+            <div class="mode-tabs" role="group" aria-label="View mode">
+              <button class="mode-button" type="button" data-mode="original">Original</button>
+              <button class="mode-button active" type="button" data-mode="split" title="Compare with a draggable divider">Slider</button>
+              <button class="mode-button" type="button" data-mode="side" title="Show both images side by side">Side by side</button>
+              <button class="mode-button" type="button" data-mode="result">Result</button>
+              <button class="mode-button" type="button" data-mode="diff" title="Inspect differences across image channels">Diff</button>
+            </div>
+          <div class="bottom-inspector"><div class="metrics" aria-label="Similarity metrics"><span title="Structural similarity. Closer to 1 means more similar.">SSIM <strong id="metric-ssim">—</strong></span><span title="Peak signal-to-noise ratio. Higher means less error.">PSNR <strong id="metric-psnr">—</strong></span><span title="Percentage of pixels with RGBA differences.">Changed <strong id="metric-changed">—</strong></span></div></div>
+            <div class="viewer-tools"><div class="zoom-controls" aria-label="Image zoom"><button id="zoom-out" class="icon-button" type="button" title="Zoom out" aria-label="Zoom out"><svg class="icon"><use href="#i-minus"/></svg></button><span id="zoom-label">100%</span><button id="zoom-in" class="icon-button" type="button" title="Zoom in" aria-label="Zoom in"><svg class="icon"><use href="#i-plus"/></svg></button></div><button id="fit-button" class="icon-button fit-button" type="button" title="Fit to view" aria-label="Fit to view"><svg class="icon"><use href="#i-fit"/></svg></button></div>
+            <button id="settings-button" class="settings-button" type="button">Settings</button>
+            <button id="help-button" class="icon-button" type="button" title="Help" aria-label="Help"><svg class="icon"><use href="#i-help"/></svg></button>
+          </div>
+        </section>
+      </section>
+      <aside class="settings-panel" aria-label="Processing parameters">
+        <div class="settings-scroll">
+          <section id="diff-controls" class="control-section" hidden>
+            <h2>Difference map</h2>
+            <div class="range-control"><div class="control-label"><label for="diff-gain">Gain</label><output id="diff-gain-value" for="diff-gain">×8</output></div><input id="diff-gain" type="range" min="1" max="32" step="1" value="8" title="Amplify differences for visibility. 1 shows actual differences."></div>
+            <label class="field-label" for="diff-channel">Channels</label><select id="diff-channel"><option value="rgba">RGBA · all channels</option><option value="rgb">RGB · color only</option><option value="alpha">Alpha · transparency</option></select>
+          </section>
+          <form id="settings-form">
+            <section class="control-section generation-section">
+              <div class="card-header"><h2>Generation</h2><button id="reset-button" class="icon-button" type="button" title="Reset processing parameters" aria-label="Reset processing parameters"><svg class="icon"><use href="#i-reset"/></svg></button></div>
+              <div class="range-control"><div class="control-label"><label for="denoise" title="Higher values allow the model to change more of the image.">Denoise</label><output id="denoise-value" for="denoise">0.25</output></div><input id="denoise" type="range" min="0.125" max="0.875" step="0.025" value="0.25" title="Denoise strength"></div>
+              <div class="range-control"><div class="control-label"><label for="steps" title="Diffusion schedule length. Actual step count also depends on denoise.">Steps</label><output id="steps-value" for="steps">32</output></div><input id="steps" type="range" min="4" max="64" step="4" value="32" title="Full diffusion schedule. At Denoise 0.25, Steps 32 runs 8 sampling steps."></div>
+              <div class="range-control"><div class="control-label"><label for="passes" title="Each pass processes the previous result. Changes accumulate.">Passes</label><output id="passes-value" for="passes">1</output></div><input id="passes" type="range" min="1" max="4" step="1" value="1" title="Number of processing passes"></div>
+              <div class="field-row seed-row"><label class="field-label" for="seed" title="Use a fixed seed for repeatable runs.">Seed</label><div class="seed-field"><input id="seed" type="text" inputmode="numeric" placeholder="Random" autocomplete="off"><button id="random-seed" class="icon-button" type="button" title="Generate a random seed" aria-label="Generate a random seed"><svg class="icon"><use href="#i-dice"/></svg></button></div></div>
+            </section>
+            <section class="control-section restore-section">
+              <div class="section-heading"><h2>Detail restoration</h2><label class="switch" title="Restore details from the original after generation"><input id="restore" type="checkbox" checked aria-label="Enable detail restoration"><span></span></label></div>
+              <div id="restore-settings">
+                <div class="range-control"><div class="control-label"><label for="sigma" title="Higher sigma restores larger structures from the original.">Sigma</label><output id="sigma-value" for="sigma">1.95</output></div><input id="sigma" type="range" min="0.5" max="3" step="0.05" value="1.95" title="Detail restoration sigma"></div>
+                <div class="field-row method-row"><label class="field-label" for="restore-mode">Method</label><select id="restore-mode"><option value="gaussian">Gaussian</option><option value="edge">Edge</option></select></div>
+                <div class="range-control sharpen-control"><div class="control-label"><label for="unsharp" title="Additional sharpening after detail restoration. High values can create halos.">Sharpen</label><output id="unsharp-value" for="unsharp">0.00</output></div><input id="unsharp" type="range" min="0" max="1" step="0.05" value="0" title="Sharpening amount"></div>
+              </div>
+            <label class="checkbox-row" title="Also save the generated image before restoring details from the original."><input id="keep-intermediate" type="checkbox"><span>Keep pre-restoration image</span></label>
+            </section>
+
+          </form>
+
+        </div>
+        <div class="process-panel"><div id="processing-feedback" hidden><div class="processing-status" role="status" aria-live="polite"><span id="live-status"></span><span id="progress-label"></span></div><progress id="progress-bar" max="100" value="0" aria-label="Processing progress"></progress></div><div class="process-actions"><button id="process-button" class="button button-primary" type="button" disabled><span id="process-label">Process image</span></button><button id="export-button" class="button" type="button" disabled title="Export the current image or difference map as PNG"><svg class="icon"><use href="#i-download"/></svg>Export PNG</button></div></div>
+      </aside>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="alert" aria-live="polite"></div>
+  <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
+    <div class="dialog-heading"><h2 id="settings-title">Settings</h2><div class="dialog-heading-actions"><button id="refresh-settings" class="button" type="button" title="Rescan available models and devices">Refresh</button><button id="close-settings" class="icon-button" type="button" title="Close settings without saving" aria-label="Close settings without saving"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button></div></div>
+    <div class="settings-dialog-content">
+      <section class="preset-controls" aria-label="Presets">
+        <label class="runtime-control" for="preset-select"><span>Preset</span><select id="preset-select"><option value="">Custom</option></select></label>
+        <label class="runtime-control" for="preset-name"><span>Preset name</span><input id="preset-name" type="text" maxlength="80" autocomplete="off" placeholder="Enter a name"></label>
+        <div class="preset-actions"><button id="save-preset" class="button" type="button">Save preset</button><button id="delete-preset" class="button" type="button" disabled>Delete</button></div>
+      </section>
+      <div class="model-runtime-settings">
+        <label class="runtime-control model-control" for="transformer"><span>Model</span><select id="transformer"><option value="">Automatic</option></select></label><div class="visually-hidden" id="model-label">Checking available models…</div>
+        <label class="runtime-control model-control" for="lightning"><span>Lightning adapter</span><select id="lightning" title="Lightning adapter used with the GGUF model. An 8-step adapter needs enough sampling steps; at Denoise 0.25, set Steps to 32 for 8 actual steps."><option value="">Automatic</option></select></label>
+        <div class="runtime-controls" role="group" aria-label="Processing runtime">
+          <label class="runtime-control runtime-device" for="device-select"><span>Device</span><select id="device-select" title="Device used for the next processing run. Auto selects an available GPU, otherwise CPU."><option value="auto">Auto</option></select></label>
+          <label class="runtime-control runtime-offload" for="offload-select"><span>Offload</span><select id="offload-select" title="Sequential uses the least VRAM and is slowest. Model uses more VRAM. Disabled keeps the model on GPU. CPU does not use offload."><option value="auto">Auto</option><option value="sequential">Sequential</option><option value="model">Model</option><option value="none">Disabled</option></select></label>
+          <label class="runtime-control runtime-precision" for="precision-select"><span>Precision</span><select id="precision-select" title="Numeric precision for the next processing run. Auto selects BF16 when supported, otherwise FP32. FP16 is unavailable because Qwen-Image can overflow and produce black images."><option value="auto">Auto</option><option value="bfloat16">BF16</option><option value="float16" disabled>FP16 (unsupported)</option><option value="float32">FP32</option></select></label>
+        </div>
+        <p id="settings-message" class="settings-message" role="status" aria-live="polite" hidden></p>
+      </div>
+    </div>
+    <div class="dialog-actions"><button id="cancel-settings" class="button" type="button">Cancel</button><button id="save-settings" class="button button-primary" type="button">Save settings</button></div>
+  </dialog>
+  <dialog id="help-dialog" class="help-dialog"><div class="dialog-heading"><h2>Help</h2><button id="close-help" type="button" class="icon-button" aria-label="Close help"><svg class="icon"><use href="#i-close"/></svg></button></div><dl><dt>Open and process</dt><dd>Open a source image, set parameters and click Process. Generation settings apply to the next run. Restoration settings can be adjusted after generation.</dd><dt>Compare</dt><dd>Choose a mode in the bottom toolbar. Drag the divider in Slider mode. Side by side shows both images. Original and Result show one image at a time.</dd><dt>Zoom and pan</dt><dd>Scroll to zoom and drag to pan. Fit to view resets the view. Use the arrow keys while the divider is focused to move it.</dd><dt>Difference map</dt><dd>Diff shows absolute pixel differences. Black means identical. Gain amplifies changes. RGBA includes color and transparency; Alpha shows transparency changes alone.</dd><dt>Settings</dt><dd>Open Settings to choose the GGUF model, Lightning adapter, device, offload mode and precision. Refresh rescans available weights and devices without restarting the server. Save settings applies changes; Cancel discards them. Presets store processing parameters and model choices in this browser. Selecting a preset applies it only after Save settings. Automatic selects the available default adapter. At Denoise 0.25, Steps 32 gives 8 actual sampling steps; changing the adapter does not change your Steps setting. Auto selects a compatible device and precision. Sequential offload uses the least VRAM and is slowest; Model offload uses more VRAM; Disabled keeps the model on GPU. CPU does not use offload.</dd><dt>Parameters</dt><dd>Denoise controls the strength of changes. Steps sets the full diffusion schedule; img2img runs a fraction of it according to Denoise. Passes repeats generation. Use a fixed seed for repeatable comparisons. Sigma controls detail restoration scale; Edge follows contours. Sharpen adds final sharpening.</dd><dt>Export</dt><dd>Export PNG saves the selected image or difference map. PNG supports transparency.</dd></dl></dialog>
+</body>
+</html>
