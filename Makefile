@@ -20,7 +20,7 @@ help:
 	@echo make doctor  - check dependencies, device and model assets
 	@echo make gui    - open the local image editor and comparison workspace
 	@echo make run INPUT=original.png
-	@echo make compare INPUT=original.png OUTPUT=out/original_desynth_s32_d0.250_p1_r1.95.png
-	@echo make visual INPUT=original.png OUTPUT=out/original_desynth_s32_d0.250_p1_r1.95.png
-	@echo make diff INPUT=original.png OUTPUT=out/original_desynth_s32_d0.250_p1_r1.95.png
+	@echo make compare INPUT=original.png OUTPUT=out/your_result.png
+	@echo make visual INPUT=original.png OUTPUT=out/your_result.png
+	@echo make diff INPUT=original.png OUTPUT=out/your_result.png
 	@echo Variables: PYTHON VENV BACKEND MODEL LIGHTNING LIGHTNING_LORA LIGHTNING_SCALE PORT GUI_ARGS INPUT OUTPUT ARGS VISUAL_OUT DIFF_OUT PREVIEW_OUT RAW_OUT GAIN

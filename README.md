@@ -19,6 +19,7 @@ py -3.11 scripts/project.py setup
 Setup creates `.venv`, installs dependencies, downloads missing weights into
 `ai/`, caches the VAE/configs and checks that everything is ready. Keep the
 included `embeds_cache.pt`; it is required by the pipeline.
+Direct dependency versions are pinned to the tested environment.
 
 On a fresh install, setup asks which GGUF model to download. Press Enter for
 **Q4_K_M**, the smaller option (~13 GB), or choose **Q8_0** (~21.8 GB).
@@ -61,9 +62,14 @@ Internet access to download missing assets.
 3. Compare with **Original**, **Slider**, **Side by side** or **Result** in the
    bottom toolbar. Drag the divider in Slider mode; scroll to zoom and drag to pan.
 4. Adjust **Detail restoration** after processing to change Sigma, Method or
-   Sharpen without running diffusion again.
+   Sharpen without running diffusion again. The latest adjustment replaces any
+   waiting preview; temporary previews are kept in a bounded cache.
 5. Click **Export PNG**. Original exports the source, Diff exports the visible
    difference map, and the other modes export the result.
+
+**Keep pre-restoration image** saves the clean intermediate PNG permanently.
+With it off, the clean image is temporary but remains available for live
+restoration during the session.
 
 ### Settings and presets
 
@@ -163,10 +169,14 @@ For Q8, keep the same adapter and sampling settings:
   --steps 32 --denoise 0.25 --seed 42
 ```
 
-Both explicit examples write `out/original_desynth_s32_d0.250_p1_r1.95.png`.
-Copy the result before trying another model or seed: these choices are not
-included in the filename. Device, precision and offload are automatic in the
-CLI; use Settings in the GUI to select them manually.
+Each run prints unique PNG filenames in `out/` containing the model, adapter,
+seed and a run ID, so trying another model or repeating a run preserves earlier
+results. A JSON manifest beside the images records the source, models, settings
+and output paths. CLI and GUI use the same image sizing and preserve the source
+alpha channel in the final RGBA PNG.
+
+Device, precision and offload are automatic in the CLI; use Settings in the GUI
+to select them manually.
 
 ### Options
 
@@ -190,8 +200,10 @@ CLI; use Settings in the GUI to select them manually.
 Print similarity metrics, or save a side-by-side comparison:
 
 ```powershell
-.\.venv\Scripts\python.exe compare.py original.png out/original_desynth_s32_d0.250_p1_r1.95.png
-.\.venv\Scripts\python.exe compare.py original.png out/original_desynth_s32_d0.250_p1_r1.95.png --visual --visual-out out/comparison.png
+# Set this to the result path printed by your processing run.
+$result = "out/your_result.png"
+.\.venv\Scripts\python.exe compare.py original.png $result
+.\.venv\Scripts\python.exe compare.py original.png $result --visual --visual-out out/comparison.png
 ```
 
 `compare.py` measures RGB similarity and resizes the second image if needed.
@@ -200,7 +212,7 @@ SSIM and PSNR describe similarity to the source; they do not test for a watermar
 Save a visible difference map including alpha:
 
 ```powershell
-.\.venv\Scripts\python.exe diff.py original.png out/original_desynth_s32_d0.250_p1_r1.95.png --out out/diff.png --gain 8
+.\.venv\Scripts\python.exe diff.py original.png $result --out out/diff.png --gain 8
 ```
 
 `diff.py` requires matching image dimensions. Its main PNG stays opaque so that
@@ -219,9 +231,10 @@ Use the main diff PNG for viewing.
 | `make prepare` | Cache VAE and pipeline configs. |
 | `make doctor` | Check dependencies, hardware and model files. |
 | `make run INPUT=original.png ARGS="--seed 42"` | Process an image. |
-| `make compare` / `make visual` / `make diff` | Compare the default source and s32 output. |
+| `make compare OUTPUT=out/your_result.png` | Print similarity metrics. |
+| `make visual OUTPUT=out/your_result.png` / `make diff OUTPUT=out/your_result.png` | Save a comparison or difference map. |
 
-Comparison targets accept `INPUT` and `OUTPUT`. Run `make` to list commands.
+Comparison targets accept `INPUT` and require `OUTPUT`. Run `make` to list commands.
 Without Make, use `py -3.11 scripts/project.py doctor` for a readiness check.
 
 ## If something goes wrong
