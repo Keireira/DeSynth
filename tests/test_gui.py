@@ -29,6 +29,11 @@ class GuiHTTPTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temporary = tempfile.TemporaryDirectory(prefix="desynth-gui-test-")
         cls.root = Path(cls.temporary.name)
+        (cls.root / "ai").mkdir()
+        for steps in (4, 8):
+            (cls.root / "ai" / f"Qwen-Image-2512-Lightning-{steps}steps-V1.0-fp32.safetensors").write_bytes(b"test adapter")
+        (cls.root / "test.gguf").write_bytes(b"test transformer")
+        (cls.root / "embeds_cache.pt").write_bytes(b"test embeddings")
         cls.patches = (
             patch.object(gui, "ROOT", cls.root),
             patch.object(gui, "STORE", cls.root / "out" / "gui"),
@@ -212,6 +217,60 @@ class GuiHTTPTests(unittest.TestCase):
         self.assertEqual(session["runtime"]["default_device"], "cpu")
         self.assertEqual([item["id"] for item in session["runtime"]["devices"]], ["cpu"])
 
+    def test_state_discovers_ai_adapters_and_prefers_the_8_step_profile(self):
+        status, session, _headers = self.request("/api/state")
+        self.assertEqual(status, 200)
+        self.assertTrue(session["ready"], session["missing"])
+        self.assertEqual([item["steps"] for item in session["lightning_adapters"]], [8, 4])
+        self.assertEqual(session["default_lightning"], "ai/Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors")
+        self.assertEqual(session["default_steps"], 32)
+
+    def test_automatic_model_fallback_never_tries_a_larger_quant(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            models = [{"path": f"Q{bits}.gguf"} for bits in (4, 2, 8, 3)]
+            for bits in (4, 2, 8, 3):
+                (root / f"Q{bits}.gguf").write_bytes(b"x" * bits)
+            self.assertEqual(gui.automatic_model_paths(models, root), ["Q4.gguf", "Q3.gguf", "Q2.gguf"])
+            self.assertEqual(gui.automatic_model_paths([models[2]], root), ["Q8.gguf"])
+
+    def test_invalid_adapter_paths_and_scales_never_start_a_job(self):
+        source = self.upload(Image.new("RGBA", (16, 16)))
+        invalid = (
+            {"lightning": "../outside.safetensors"},
+            {"lightning": "missing.safetensors"},
+            {"lightning": ["not a path"]},
+            {"lightning_scale": 0}, {"lightning_scale": -1},
+            {"lightning_scale": True}, {"lightning_scale": float("nan")},
+        )
+        for params in invalid:
+            with self.subTest(params=params):
+                status, error, _headers = self.request("/api/process", {"source_id": source["id"], "params": params})
+                self.assertEqual(status, 400, error)
+        self.assertFalse(self.studio.jobs)
+        self.assertIsNone(self.studio.module)
+
+    def test_adapter_profile_defaults_do_not_override_explicit_steps(self):
+        source = self.upload(Image.new("RGBA", (16, 16)))
+        completed = threading.Event()
+
+        def finish_without_loading(*_args):
+            self.studio.active = None
+            completed.set()
+
+        with patch.object(self.studio, "work", side_effect=finish_without_loading):
+            for profile, explicit, expected in ((8, None, 32), (4, None, 8), (8, 12, 12)):
+                completed.clear()
+                adapter = f"ai/Qwen-Image-2512-Lightning-{profile}steps-V1.0-fp32.safetensors"
+                params = {"lightning": adapter}
+                if explicit is not None:
+                    params["steps"] = explicit
+                status, job, _headers = self.request("/api/process", {"source_id": source["id"], "params": params})
+                self.assertEqual(status, 202, job)
+                self.assertTrue(completed.wait(1))
+                self.assertEqual(job["lightning"], adapter)
+                self.assertEqual(job["steps"], expected)
+
     def test_unavailable_devices_and_unsupported_cpu_options_do_not_start_jobs(self):
         source = self.upload(Image.new("RGBA", (16, 16)))
         invalid = (
@@ -311,29 +370,38 @@ class GuiHTTPTests(unittest.TestCase):
             ),
         )
         cases = (
-            ("cuda:0", "sequential", "bfloat16", 1),
-            ("cuda:0", "sequential", "bfloat16", 1),  # Identical runtime reuses the pipeline.
-            ("cuda:1", "sequential", "bfloat16", 2),  # Device alone changes.
-            ("cuda:1", "model", "bfloat16", 3),       # Offload alone changes.
-            ("cuda:1", "model", "float32", 4),        # Precision alone changes.
-            ("cpu", "none", "float32", 5),
+            ("cuda:0", "sequential", "bfloat16", 8, .8, 1),
+            ("cuda:0", "sequential", "bfloat16", 8, .8, 1),  # Identical configuration reuses the pipeline.
+            ("cuda:1", "sequential", "bfloat16", 8, .8, 2),  # Device alone changes.
+            ("cuda:1", "model", "bfloat16", 8, .8, 3),       # Offload alone changes.
+            ("cuda:1", "model", "float32", 8, .8, 4),        # Precision alone changes.
+            ("cpu", "none", "float32", 8, .8, 5),
+            ("cpu", "none", "float32", 4, .8, 6),          # Adapter alone changes.
+            ("cpu", "none", "float32", 4, .6, 7),          # Adapter strength alone changes.
+            ("cpu", "none", "float32", 4, .6, 7),
         )
         with patch.object(self.studio, "state", return_value={"ready": True}):
-            for device, offload, precision, expected_builds in cases:
-                with self.subTest(device=device, offload=offload, precision=precision):
+            for device, offload, precision, profile, scale, expected_builds in cases:
+                adapter = f"ai/Qwen-Image-2512-Lightning-{profile}steps-V1.0-fp32.safetensors"
+                with self.subTest(device=device, offload=offload, precision=precision, adapter=adapter, scale=scale):
                     status, accepted, _headers = self.request("/api/process", {
                         "source_id": source["id"], "params": {
                             "device": device, "offload": offload, "precision": precision,
                             "restore": False, "seed": 42,
+                            "lightning": adapter, "lightning_scale": scale,
                         },
                     })
                     self.assertEqual(status, 202, accepted)
                     finished = self.wait_for_job(accepted["id"])
                     self.assertEqual(finished["status"], "done", finished.get("error"))
                     self.assertEqual(build.call_count, expected_builds)
-                    self.assertEqual(self.studio.pipe_key, ("test.gguf", device, offload, precision))
+                    self.assertEqual(self.studio.pipe_key, (
+                        gui.weight_identity(self.root / "test.gguf"), gui.weight_identity(self.root / adapter),
+                        scale, device, offload, precision,
+                    ))
                     self.assertEqual(build.call_args.kwargs, {
                         "device": device, "offload": offload, "compute_dtype": precision,
+                        "lightning_lora": self.root / adapter, "lightning_scale": scale,
                     })
                     prepared = sample.call_args.args[2]
                     self.assertNotIn("meta", prepared)
