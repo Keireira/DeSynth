@@ -22,5 +22,5 @@ DIFF_OUT ?= out/diff.png
 PREVIEW_OUT ?=
 RAW_OUT ?=
 GAIN ?= 8
-PORT ?= 7860
+PORT ?= 8758
 GUI_ARGS ?=

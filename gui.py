@@ -1,4 +1,4 @@
-"""Local browser UI for DeSynth. Run: python gui.py [--port 7860]."""
+"""Local browser UI for DeSynth. Run: python gui.py [--port 8758]."""
 from __future__ import annotations
 
 import argparse
@@ -703,7 +703,7 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="DeSynth local GUI")
     parser.add_argument("--host", default="127.0.0.1", help="loopback address only (127.0.0.1, localhost, ::1)")
-    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--port", type=int, default=8758)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
     try:
