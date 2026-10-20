@@ -1,6 +1,7 @@
 # Use forward slashes so the same recipes work in cmd.exe and POSIX shells.
 VENV ?= .venv
 BACKEND ?= auto
+MODEL ?= auto
 LIGHTNING ?= auto
 LIGHTNING_LORA ?=
 LIGHTNING_SCALE ?= 0.8
