@@ -33,20 +33,18 @@ the original dimensions and alpha channel.
 
 ### Setup
 
-Use **Python 3.11**. From the repository folder in Windows PowerShell:
+Install **Python 3.11** and **GNU Make**, then run from the repository folder:
 
-```powershell
-py -3.11 scripts/project.py setup
-.\.venv\Scripts\python.exe gui.py
+```sh
+make setup
+make gui
 ```
 
 Setup installs dependencies and downloads models into `ai/`. The default is
 **Q4_K_M**, the smaller model. Keep the included `embeds_cache.pt`.
 
-On Linux/macOS, use `python3.11` for setup and `.venv/bin/python` to run scripts.
-For CPU-only installation, add `--backend cpu` to setup.
-
-With GNU Make: `make setup`, then `make gui`. Use `make doctor` to check setup.
+For CPU-only installation, use `make setup BACKEND=cpu`.
+Use `make doctor` to check setup and `make help` to list commands.
 
 ### Models
 
@@ -65,8 +63,8 @@ Qwen-Image-2512 model can be selected in Settings or with `--transformer`.
 
 To download Q8 after setup:
 
-```powershell
-py -3.11 scripts/project.py models --model q8
+```sh
+make models MODEL=q8
 ```
 
 ### GUI
@@ -84,20 +82,21 @@ in Original or Diff, it saves that image.
 added models; **Save settings** applies choices. Sequential offload uses RAM to
 reduce VRAM use. Leave Precision on Auto.
 
+![Model, device and preset settings](docs/images/settings.jpg)
+
 ### CLI
 
-Commands below use the Windows virtual environment. On Linux/macOS, replace
-`.\.venv\Scripts\python.exe` with `.venv/bin/python`.
+Pass processing options through `ARGS`. `INPUT` defaults to `original.png`.
 
-```powershell
+```sh
 # Process original.png with automatic model selection
-.\.venv\Scripts\python.exe desynth.py --seed 42
+make run ARGS="--seed 42"
 
 # Repeat with Edge restoration
-.\.venv\Scripts\python.exe desynth.py original.png --denoise 0.25 --steps 32 --seed 42 --restore-mode edge
+make run ARGS="--seed 42 --restore-mode edge"
 
 # Select Q8 explicitly
-.\.venv\Scripts\python.exe desynth.py original.png --transformer ai/Qwen-Image-2512-Q8_0.gguf --seed 42
+make run ARGS="--transformer ai/Qwen-Image-2512-Q8_0.gguf --seed 42"
 ```
 
 For `original.png`, final images and `comparison_...` PNGs go to `out/` with
@@ -124,18 +123,19 @@ Defaults below assume the 8-step adapter.
 | `--lightning PATH` | Automatic, prefers 8-step FP32 | Select a Lightning adapter |
 
 The 4-step adapter keeps its CLI default of 8 total steps. Set `--steps 16`
-at Denoise 0.25 for four sampling steps. Use `--help` for all options.
+at Denoise 0.25 for four sampling steps. Use `make run ARGS="--help"` for all options.
 
 ### Quality check
 
-```powershell
-$result = "out/Original_desynth_s32_d0.250_p1_r1.95.png"
-.\.venv\Scripts\python.exe compare.py original.png $result
-.\.venv\Scripts\python.exe diff.py original.png $result --out out/diff.png --gain 8
+```sh
+make compare OUTPUT=out/Original_desynth_s32_d0.250_p1_r1.95.png
+make diff OUTPUT=out/Original_desynth_s32_d0.250_p1_r1.95.png GAIN=8
 ```
 
-`compare.py` prints similarity metrics. `diff.py` saves a visible RGBA difference
+`make compare` prints similarity metrics. `make diff` saves a visible RGBA difference
 map; Gain amplifies small changes. Black means identical pixels.
+
+![Diff view with visible differences amplified](docs/images/diff.jpg)
 
 ## Hardware
 
