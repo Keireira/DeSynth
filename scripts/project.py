@@ -119,7 +119,7 @@ def prepare() -> None:
     print("VAE and configs are cached; transformer/text encoder weights were not requested.", flush=True)
 
 
-def doctor(backend: str) -> None:
+def doctor(backend: str, lightning: str = "auto") -> None:
     print(f"Python {sys.version.split()[0]}: {sys.executable}")
     print(f"Dependency backend: {backend}")
     failures = []
@@ -157,10 +157,16 @@ def doctor(backend: str) -> None:
             print(f"Device: {'MPS' if torch.backends.mps.is_available() else 'CPU'}")
     except Exception as exc:
         failures.append(f"PyTorch device check: {exc}")
-    if not any(present(name) for name in GGUF_NAMES):
+    gguf = installed_gguf()
+    if gguf is None:
         failures.append("Missing GGUF model. Run make models.")
-    if not present(LORA_NAME):
-        failures.append("Missing Lightning LoRA. Run make models.")
+    else:
+        print(f"GGUF: {gguf}")
+    adapter = next((find_asset(name) for name in lightning_candidates(lightning) if present(name)), None)
+    if adapter is None:
+        failures.append(f"Missing Lightning LoRA ({lightning}). Run make models LIGHTNING={lightning}.")
+    else:
+        print(f"Lightning: {adapter}")
     try:
         require_embeds()
     except RuntimeError as exc:
@@ -178,17 +184,17 @@ def doctor(backend: str) -> None:
     print("Ready: dependencies, device, model files, and VAE/config cache are available.", flush=True)
 
 
-def worker(command: str, directory: Path, backend: str) -> None:
+def worker(command: str, directory: Path, backend: str, lightning: str = "auto") -> None:
     # Compare prefixes, not executable paths: POSIX venv interpreters can be symlinks.
     if Path(sys.prefix).resolve() != directory:
         run(str(require_env(directory)), str(Path(__file__).resolve()), command,
-            "--venv", str(directory), "--backend", backend)
+            "--venv", str(directory), "--backend", backend, "--lightning", lightning)
     elif command == "models":
-        download_models()
+        download_models(lightning)
     elif command == "prepare":
         prepare()
     else:
-        doctor(backend)
+        doctor(backend, lightning)
 
 
 def main() -> None:
@@ -196,6 +202,8 @@ def main() -> None:
     parser.add_argument("command", choices=("help", "venv", "install", "models", "prepare", "doctor", "setup"))
     parser.add_argument("--venv", type=Path, default=Path(".venv"))
     parser.add_argument("--backend", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--lightning", choices=("auto", "4", "8"), default="auto",
+                        help="adapter to prepare/check; auto reuses 8-step, then 4-step, or downloads 8-step FP32")
     args = parser.parse_args()
     if args.command == "help":
         parser.print_help()
@@ -218,9 +226,9 @@ def main() -> None:
         elif args.command == "setup":
             install(directory, backend)
             for command in ("models", "prepare", "doctor"):
-                worker(command, directory, backend)
+                worker(command, directory, backend, args.lightning)
         else:
-            worker(args.command, directory, backend)
+            worker(args.command, directory, backend, args.lightning)
     except subprocess.CalledProcessError as exc:
         raise SystemExit(exc.returncode) from exc
     except Exception as exc:
