@@ -45,8 +45,8 @@ shape continuity at contours.
 ```mermaid
 flowchart TD
     A["Original.png"]
-    B["Qwen-Image GGUF Q4<br>+ Lightning 4-step LoRA"]
-    B_note["2 Lightning steps\n(strength 0.25)"]
+    B["Qwen-Image GGUF<br>+ selected Lightning LoRA"]
+    B_note["8 actual steps with 8-step adapter\n32 scheduler steps × strength 0.25"]
     C["Frequency-domain restore<br>low_clean + high_orig"]
     C_note["Gaussian split, sigma=1.95<br>low band from clean<br>high band from Original"]
     D["[output]\nNAME_desynth_r1.95.png"]
@@ -86,9 +86,11 @@ On Linux/macOS, replace `py -3.11` with `python3.11`. The helper also accepts
 `setup` creates `.venv`, installs all dependencies (including comparison tools),
 downloads missing GGUF and LoRA model files, caches the VAE and pipeline configs
 from Hugging Face, and runs a readiness check. Existing model files are skipped.
-The two model downloads total approximately 14.5 GB; allow additional space for
-the virtual environment and Hugging Face cache. Keep the included `embeds_cache.pt`
-in the repository root: the pipeline requires these precomputed embeddings.
+New model downloads go into `ai/`: Q4_K_M and the 8-step FP32 Lightning adapter
+total approximately 14.7 GB. Allow additional space for the virtual environment
+and Hugging Face cache. Existing GGUF and Lightning files in `ai/` or the repository
+root are reused; setup does not download another quantization just because Q4 is
+absent. Keep the included `embeds_cache.pt`: the pipeline requires these precomputed embeddings.
 
 `make` alone shows help. Individual preparation steps are available:
 
@@ -99,6 +101,13 @@ in the repository root: the pipeline requires these precomputed embeddings.
 | `make models` | download missing GGUF and LoRA model files |
 | `make prepare` | cache the VAE and pipeline configs from Hugging Face |
 | `make doctor` | check Python, imports, PyTorch/CUDA, and model assets without loading the large pipeline |
+
+`LIGHTNING=auto` prefers an installed 8-step adapter, falls back to an installed
+4-step adapter, and downloads 8-step FP32 only when neither is installed. To
+prepare a specific adapter, use `make models LIGHTNING=8` or `LIGHTNING=4`.
+The direct helper accepts the equivalent `--lightning auto`, `--lightning 8`,
+or `--lightning 4`. These options select the adapter to prepare or check;
+inference selection is described below.
 
 By default, `PYTHON` is `py -3.11` on Windows and `python3.11` elsewhere.
 `VENV` defaults to `.venv`. Override either when needed:
@@ -120,12 +129,27 @@ The CUDA dependency set is in `requirements.txt`; the CPU dependency set is in
 `requirements_mac.txt`. The pipeline selects CUDA, Apple MPS, or CPU according to
 the hardware available to PyTorch.
 
-Models can also be downloaded manually into the repository root:
+Models can also be downloaded manually into `ai/`. The current layout is:
+
+```text
+DeSynth/
+├── ai/
+│   ├── Qwen-Image-2512-Q4_K_M.gguf
+│   ├── Qwen-Image-2512-Q8_0.gguf
+│   ├── Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors
+│   └── Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors
+└── embeds_cache.pt
+```
+
+Only one GGUF and one Lightning adapter are required. Q8 is optional and requires
+more memory than Q4. Root-level model files remain supported for older installations.
 
 | file                                                      | size   | source |
 |-----------------------------------------------------------|--------|--------|
-| `qwen-image-2512-Q4_K_M.gguf`                             | ~13 GB | [Frederic75/Qwen-Image-2512-GGUF](https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF) |
-| `Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors`  | ~1.6 GB | [lightx2v/Qwen-Image-2512-Lightning](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning) |
+| `Qwen-Image-2512-Q4_K_M.gguf`                             | ~13 GB | [Frederic75/Qwen-Image-2512-GGUF](https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF) |
+| `Qwen-Image-2512-Q8_0.gguf`                               | ~21.8 GB | [Frederic75/Qwen-Image-2512-GGUF](https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF) |
+| `Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors`  | ~1.7 GB | [lightx2v/Qwen-Image-2512-Lightning](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning) |
+| `Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors`  | ~1.7 GB | [lightx2v/Qwen-Image-2512-Lightning](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning) |
 
 
 ### GUI
@@ -165,7 +189,8 @@ may be loaded automatically when available. View modes and zoom are available in
 - Click **Export PNG** to save the original, result, or visible diff, depending
   on the selected view. Slider and Side by side export the result.
 
-Open **Settings** to choose the **Model**, **Device**, **CPU offload**, and **Precision**.
+Open **Settings** in the bottom toolbar to choose the **Model**, **Lightning adapter**,
+**Device**, **CPU offload**, and **Precision**.
 These settings apply when you next click
 **Process**. The pipeline reloads when the effective configuration changes;
 the job status shows the settings actually used. Available choices follow the
@@ -173,6 +198,8 @@ detected hardware.
 
 | setting | choices and effect |
 |---------|--------------------|
+| Model | A GGUF transformer found in `ai/` or the repository root. Q4 is the default when available; Q8 can be selected explicitly. |
+| Lightning adapter | Choose the 4-step or 8-step adapter independently of the GGUF quantization. The installed 8-step FP32 adapter is preferred by default. Changing the adapter reloads the pipeline on the next processing job. |
 | Device | Auto selects an available accelerator, otherwise CPU. Select CPU or a detected CUDA GPU explicitly to control where inference runs; Apple MPS is offered on supported machines. |
 | CPU offload | Auto chooses the supported default. Sequential moves individual layers from RAM to the GPU, using less VRAM but more transfers. Model moves whole pipeline components, requiring more VRAM and fewer transfers. Disabled keeps the pipeline on the selected device and requires enough device memory for it. |
 | Precision | Auto uses BFloat16 where supported, otherwise Float32. CPU uses Float32 with offload disabled. Float16 is unavailable for this Qwen model because numerical overflow can produce black images, even on GPUs that support Float16 operations. This changes computation precision while the selected GGUF model retains its existing quantization. |
@@ -192,19 +219,28 @@ download missing assets from Hugging Face as described above.
 ```powershell
 make run INPUT=original.png
 make run INPUT="path/to/image.png" ARGS="--seed 42"
+make run INPUT=original.png LIGHTNING_LORA=ai/Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors
 ```
 
 To invoke Python directly on Windows:
 
 ```powershell
 .\.venv\Scripts\python.exe desynth.py original.png --seed 42
+.\.venv\Scripts\python.exe desynth.py original.png --transformer ai/Qwen-Image-2512-Q8_0.gguf --lightning ai/Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors
 ```
 
 On Linux/macOS, use `.venv/bin/python` instead of `.\.venv\Scripts\python.exe`.
 If `VENV` was overridden, use that directory in direct Python commands.
 
-Output: `out/<name>_desynth_s8_d0.250_p1_r1.95.png`. Random seed per run by
-default. `make prepare` caches the VAE and configs ahead of time; otherwise
+The default adapter is the installed 8-step variant, falling back to 4-step.
+The 8-step adapter defaults to 32 scheduler steps; with denoise 0.25, img2img
+executes 8 actual denoising steps. The 4-step adapter retains the earlier default
+of 8 scheduler steps, or 2 actual steps at denoise 0.25. `--steps` overrides this
+schedule; selecting 8-step Lightning does not make `--steps 8 --denoise 0.25`
+execute eight denoising steps. Explicit GUI step values are also respected.
+
+Output with the 8-step defaults: `out/<name>_desynth_s32_d0.250_p1_r1.95.png`.
+Random seed per run by default. `make prepare` caches the VAE and configs ahead of time; otherwise
 the first pipeline run downloads them from Hugging Face.
 
 ### Flags
@@ -213,7 +249,7 @@ the first pipeline run downloads them from Hugging Face.
 |-----------------------|---------|-------------|
 | `--seed N`            | random  | reproducible runs |
 | `--denoise X [X X]`   | 0.25    | sweep denoise |
-| `--steps N`           | 8       | per-pass step count |
+| `--steps N`           | 32 for 8-step / 8 for 4-step | scheduler steps per pass; actual img2img steps depend on denoise |
 | `--passes N`          | 1       | iterate img2img |
 | `--restore-sigma X`   | 1.95    | tune detail restore |
 | `--restore-mode M`    | gaussian | `edge` for shape-coherent contours |
@@ -221,6 +257,8 @@ the first pipeline run downloads them from Hugging Face.
 | `--no-restore`        | off     | skip the frequency restore step |
 | `--keep-intermediate` | off     | save the pre-restore clean output |
 | `--transformer PATH`  | Q4_K_M  | try a different GGUF quant |
+| `--lightning PATH`    | installed 8-step, then 4-step | choose the Lightning LoRA independently of the transformer |
+| `--lightning-scale X` | 0.8     | adjust Lightning adapter strength |
 
 ### Quality check
 
@@ -287,8 +325,8 @@ Optional outputs are disabled by default:
 | `scripts/project.py`                                      | cross-platform setup and readiness helper                   |
 | `requirements.txt`, `requirements_mac.txt`                 | CUDA and CPU dependency entry points                        |
 | `embeds_cache.pt`                                         | cached prompt embeddings (~430 KB)            |
-| `qwen-image-2512-Q4_K_M.gguf`                             | Qwen-Image transformer, GGUF Q4 quant (~13 GB)             |
-| `Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors`  | 4-step Lightning distillation LoRA (~1.6 GB)               |
+| `ai/*.gguf`                                               | selectable Qwen-Image GGUF transformers; Q4 ~13 GB, Q8 ~21.8 GB |
+| `ai/*Lightning*.safetensors`                               | selectable 4-step and 8-step Lightning adapters; FP32 ~1.7 GB each |
 
 ## Hardware Requirements
 
@@ -297,10 +335,9 @@ Sequential CPU offload is required with < 12GB VRAM
 
 ## Known limitations
 
-- Lightning's 4-step distillation is the source of most of the residual
-  drift.
-  (Dropping it for proper 20+ step sampling would likely tighten metrics further at the cost of 5x longer
-  runs.)
+- The reported metrics above were produced with the earlier 4-step adapter workflow.
+  An 8-step adapter trades more processing time for a different sampling result;
+  quality should be compared with the same image and seed.
 
 ## Credits
 
