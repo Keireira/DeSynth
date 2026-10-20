@@ -345,7 +345,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", nargs="?", default=str(DEFAULT_INPUT), help="input image path")
     parser.add_argument("--denoise", type=float, nargs="+", default=[DEFAULT_DENOISE], help="denoise strength(s)")
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="sampler steps")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="total img2img schedule steps; default 32 for 8-step Lightning, 8 for 4-step")
     parser.add_argument("--passes", type=int, default=1, help="sequential img2img passes")
     parser.add_argument("--seed", type=int, default=None, help="random per run if omitted")
     parser.add_argument("--restore-sigma", type=float, default=DEFAULT_RESTORE_SIGMA, help="freq-restore sigma; cliff at 2.0")
@@ -353,9 +354,30 @@ def main() -> None:
     parser.add_argument("--unsharp", type=float, default=0.0, help="post-restore sharpening; try 0.2 for perceptual lift")
     parser.add_argument("--no-restore", dest="restore", action="store_false", help="skip frequency restore")
     parser.add_argument("--keep-intermediate", action="store_true", help="also save the pre-restore output")
-    parser.add_argument("--transformer", type=Path, default=GGUF_TRANSFORMER, help="alt GGUF transformer path")
+    parser.add_argument("--transformer", type=Path, default=None, help="GGUF path; bare filenames resolve in ai/ first")
+    parser.add_argument("--lightning", type=Path, default=LIGHTNING_LORA,
+                        help="Lightning LoRA path; defaults to local 8-step adapter, then legacy 4-step")
+    parser.add_argument("--lightning-scale", type=float, default=DEFAULT_LIGHTNING_SCALE, help="Lightning LoRA strength (default 0.8)")
     parser.set_defaults(restore=True)
     args = parser.parse_args()
+
+    args.lightning = resolve_model_path(args.lightning)
+    if args.steps is None:
+        args.steps = default_steps_for_lightning(args.lightning)
+    if args.steps < 1:
+        parser.error("--steps must be at least 1")
+    if args.passes < 1:
+        parser.error("--passes must be at least 1")
+    if not math.isfinite(args.lightning_scale) or args.lightning_scale <= 0:
+        parser.error("--lightning-scale must be a finite number greater than zero")
+    if not _nonempty_file(args.lightning):
+        parser.error(f"Lightning adapter not found: {args.lightning}")
+    if any(not 0 < strength <= 1 for strength in args.denoise):
+        parser.error("--denoise values must be greater than zero and at most 1")
+    if any(effective_img2img_steps(args.steps, strength) < 1 for strength in args.denoise):
+        parser.error("--steps * --denoise must execute at least one denoising step")
+    print(f"[schedule] {args.steps} total steps; actual per pass: "
+          + ", ".join(f"{effective_img2img_steps(args.steps, strength)} at denoise={strength:g}" for strength in args.denoise))
 
     if args.seed is None:
         import secrets
@@ -376,8 +398,9 @@ def main() -> None:
 
     # Build the fallback sequence to attempt.
     # If --transformer was given explicitly, respect it and skip auto-fallback.
-    explicit_transformer = args.transformer != GGUF_TRANSFORMER
+    explicit_transformer = args.transformer is not None
     if explicit_transformer:
+        args.transformer = resolve_model_path(args.transformer)
         attempt_chain = [(args.transformer.stem, args.transformer)]
     else:
         # Walk GGUF_FALLBACK_CHAIN; skip entries whose file isn't on disk yet.
@@ -387,8 +410,10 @@ def main() -> None:
             if p is not None:
                 attempt_chain.append((label, p))
         if not attempt_chain:
+            attempt_chain = [(path.stem, path) for path in discover_gguf_models()]
+        if not attempt_chain:
             raise SystemExit(
-                "No GGUF transformer found. Download at least one quant:\n"
+                "No GGUF transformer found in ai/ or the project root. Download at least one quant:\n"
                 "  Qwen-Image-2512-Q4_K_M.gguf  (~13 GB, best quality)\n"
                 "  Qwen-Image-2512-Q2_K_M.gguf  (~7 GB,  fallback)\n"
                 "from https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF"
@@ -408,7 +433,8 @@ def main() -> None:
 
         print(f"[quant] trying {label}  ({transformer_path.name})")
         try:
-            pipe = build_pipeline(transformer_path=transformer_path)
+            pipe = build_pipeline(transformer_path=transformer_path,
+                                  lightning_lora=args.lightning, lightning_scale=args.lightning_scale)
             # Run a single denoise pass to confirm the quant fits in memory
             # before committing to the full sweep.
             _ = run_once(
