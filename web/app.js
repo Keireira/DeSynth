@@ -8,6 +8,8 @@ const state = {
   mode: "split", split: 0.5, zoom: 1, panX: 0, panY: 0, rect: null,
   busy: false, restoring: false, generation: 0, restoreVersion: 0,
   runtime: null, environmentReady: false, inventoryReady: false, runtimeChoice: { device: "auto", offload: "auto", precision: "auto" }, runningRuntime: null,
+  modelChoice: { transformer: null, lightning: null }, models: [], lightningAdapters: [], defaultLightning: null,
+  settingsDraft: null, presets: [], refreshing: false,
   pair: null, pairLoading: null, pairVersion: 0, diffCanvas: null, diffKey: "", metricsVersion: 0, resultVersion: 0, uploadVersion: 0,
   space: false, drag: null, dirty: false,
 };
@@ -91,7 +93,9 @@ function refreshProcessingFeedback() {
 function updateCards() {
   refreshProcessingFeedback();
   $("empty-state").hidden = Boolean(state.sourceImage);
-  $("process-button").disabled = state.busy || !state.source || !state.runtime?.ready || !state.environmentReady;
+  const problem = configurationProblem({ ...state.modelChoice, ...state.runtimeChoice });
+  $("process-button").disabled = state.busy || state.refreshing || !state.source || !state.runtime?.ready || !state.environmentReady || Boolean(problem);
+  $("process-button").title = problem || "Process image";
   $("upload-button").disabled = state.busy;
   $("settings-button").disabled = state.busy;
   $("export-button").disabled = state.restoring || !(state.mode === "original" ? state.source : state.result);
@@ -389,10 +393,68 @@ function settings() {
     denoise: Number($("denoise").value), steps: Number($("steps").value), passes: Number($("passes").value), seed,
     restore_sigma: Number($("sigma").value), restore_mode: $("restore-mode").value,
     unsharp: Number($("unsharp").value), restore: $("restore").checked,
-    keep_intermediate: $("keep-intermediate").checked, transformer: $("transformer").value || null,
-    lightning: $("lightning").value || null,
+    keep_intermediate: $("keep-intermediate").checked,
+    ...state.modelChoice,
     ...state.runtimeChoice,
   };
+}
+
+function normalizedSettings(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid settings.");
+  const result = {};
+  for (const [key, fallback, min, max, integer] of [
+    ["denoise", defaults.denoise, .125, .875, false], ["steps", defaults.steps, 4, 64, true],
+    ["passes", defaults.passes, 1, 4, true], ["restore_sigma", defaults.sigma, .5, 3, false],
+    ["unsharp", defaults.unsharp, 0, 1, false],
+  ]) {
+    const number = value[key] === undefined ? fallback : value[key];
+    if (typeof number !== "number" || !Number.isFinite(number) || number < min || number > max || (integer && !Number.isInteger(number))) throw new Error(`Invalid ${key.replaceAll("_", " ")}.`);
+    result[key] = number;
+  }
+  result.seed = value.seed === "" || value.seed == null ? null : value.seed;
+  if (result.seed !== null && (!Number.isSafeInteger(result.seed) || result.seed < 0)) throw new Error("Seed must be a whole number between 0 and 9007199254740991.");
+  result.restore_mode = value.restore_mode ?? defaults.restoreMode;
+  if (!["gaussian", "edge"].includes(result.restore_mode)) throw new Error("Invalid restoration method.");
+  for (const [key, fallback] of [["restore", true], ["keep_intermediate", false]]) {
+    result[key] = value[key] === undefined ? fallback : value[key];
+    if (typeof result[key] !== "boolean") throw new Error("Invalid restoration settings.");
+  }
+  for (const key of ["transformer", "lightning"]) {
+    const path = value[key];
+    if (path != null && typeof path !== "string") throw new Error("Invalid model path.");
+    result[key] = path ? path.replaceAll("\\", "/") : null;
+  }
+  for (const key of ["device", "offload", "precision"]) {
+    result[key] = value[key] ?? "auto";
+    if (typeof result[key] !== "string" || !result[key] || result[key].length > 100) throw new Error("Invalid runtime settings.");
+  }
+  if (!["auto", "sequential", "model", "none"].includes(result.offload) || !["auto", "bfloat16", "float32"].includes(result.precision)) throw new Error("Unsupported runtime settings.");
+  return result;
+}
+
+function persistSettings(value, report = false) {
+  try { localStorage.setItem("desynth.settings.v1", JSON.stringify(value)); return true; }
+  catch { if (report) toast("Could not save settings in this browser.", true); return false; }
+}
+
+function persistLiveSettings() {
+  if (!state.inventoryReady) return;
+  try { persistSettings(settings()); } catch { /* An incomplete seed can be corrected before processing. */ }
+}
+
+function configurationProblem(value) {
+  if (!state.inventoryReady) return "Available models are still loading.";
+  for (const [key, inventory, label] of [["transformer", state.models, "model"], ["lightning", state.lightningAdapters, "Lightning adapter"]]) {
+    if (!inventory.length) return `No ${label} found. Add weights to ai/ and click Refresh.`;
+    if (value[key] && !inventory.some((item) => item.path === value[key])) return `Selected ${label} is unavailable. Choose another in Settings.`;
+  }
+  if (!state.runtime?.ready) return "Device detection is not ready.";
+  const device = state.runtime.devices.find((item) => item.id === (value.device === "auto" ? state.runtime.default_device : value.device));
+  if (!device) return "Selected device is unavailable. Choose another in Settings.";
+  for (const [key, available] of [["offload", device.offload_modes], ["precision", device.precisions]]) {
+    if (value[key] !== "auto" && !available?.includes(value[key])) return `Selected ${key} is unavailable for this device.`;
+  }
+  return "";
 }
 
 function nextRuntime() {
@@ -408,48 +470,50 @@ function nextRuntime() {
 }
 
 function refreshRuntimeControls() {
-  const ready = Boolean(state.runtime?.ready);
-  const device = state.runtime?.devices.find((item) => item.id === (state.runtimeChoice.device === "auto" ? state.runtime.default_device : state.runtimeChoice.device));
-  for (const [field, modes] of [["offload", device?.offload_modes], ["precision", device?.precisions]]) {
-    const select = $(`${field}-select`);
-    for (const option of select.options) option.disabled = option.value !== "auto" && !modes?.includes(option.value);
-    if (ready && state.runtimeChoice[field] !== "auto" && !modes?.includes(state.runtimeChoice[field])) state.runtimeChoice[field] = "auto";
-    select.value = state.runtimeChoice[field];
-  }
-  $("device-select").value = state.runtimeChoice.device;
-  for (const field of ["device", "offload", "precision"]) $(`${field}-select`).disabled = state.busy || !ready;
+  renderSettingsDialog();
 }
 
 function updateRuntimeInventory(runtime) {
   state.runtime = runtime || null;
-  const select = $("device-select");
-  select.replaceChildren();
-  const automatic = document.createElement("option");
-  automatic.value = "auto";
-  automatic.textContent = runtime?.ready ? `Auto (${runtime.default_device.toUpperCase()})` : "Detecting…";
-  select.appendChild(automatic);
-  for (const device of runtime?.devices || []) {
-    const option = document.createElement("option");
-    option.value = device.id;
-    option.textContent = device.type === "cuda" ? `${device.id.toUpperCase()} · ${device.name}` : device.name;
-    select.appendChild(option);
-  }
-  if (runtime?.ready && state.runtimeChoice.device !== "auto" && !runtime.devices.some((device) => device.id === state.runtimeChoice.device)) {
-    state.runtimeChoice.device = "auto";
-    toast("The saved device is unavailable. Device was reset to Auto.");
-  }
   refreshRuntimeControls();
-  refreshControlValues();
   updateCards();
 }
 
+function syncInventory(session) {
+  state.environmentReady = Boolean(session.ready);
+  state.models = session.models || [];
+  state.lightningAdapters = session.lightning_adapters || [];
+  state.defaultLightning = session.default_lightning || null;
+  state.inventoryReady = true;
+  updateRuntimeInventory(session.runtime);
+}
+
+let runtimePoll;
 async function detectRuntime() {
-  // Torch can take a few seconds to import while the editor remains usable.
-  while (!state.runtime?.ready) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    try { const session = await api("/api/state"); updateRuntimeInventory(session.runtime); }
-    catch { /* Retry device detection while the editor remains usable. */ }
-  }
+  if (runtimePoll) return runtimePoll;
+  runtimePoll = (async () => {
+    let attempts = 0;
+    while (!state.runtime?.ready || state.runtime?.refreshing) {
+      if (++attempts > 120) throw new Error("Device refresh timed out. Click Refresh to try again.");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      syncInventory(await api("/api/state"));
+    }
+  })();
+  try { await runtimePoll; } finally { runtimePoll = null; }
+}
+
+async function refreshInventory() {
+  if (state.refreshing || state.busy) return;
+  state.refreshing = true;
+  renderSettingsDialog();
+  updateCards();
+  try {
+    syncInventory(await api("/api/refresh", {}));
+    await detectRuntime();
+    if (state.runtime?.error) throw new Error(`Device detection failed: ${state.runtime.error}`);
+    toast("Models and devices refreshed");
+  } catch (error) { toast(error.message, true); }
+  finally { state.refreshing = false; renderSettingsDialog(); updateCards(); }
 }
 
 async function connectToServer() {
@@ -471,19 +535,181 @@ function refreshControlValues() {
   setText("diff-gain-value", `×${$("diff-gain").value}`);
   $("restore-settings").classList.toggle("disabled", !$("restore").checked);
   for (const id of ["sigma", "restore-mode", "unsharp"]) $(id).disabled = state.busy || !$("restore").checked;
-  if (state.inventoryReady) {
-    try { localStorage.setItem("desynth.settings.v1", JSON.stringify(settings())); } catch { /* Preferences are optional. */ }
-  }
 }
 
 function applySettings(value) {
-  const pairs = { denoise: value.denoise ?? defaults.denoise, steps: value.steps ?? defaults.steps, passes: value.passes ?? defaults.passes, seed: value.seed ?? "", sigma: value.restore_sigma ?? defaults.sigma, unsharp: value.unsharp ?? defaults.unsharp, "restore-mode": value.restore_mode ?? defaults.restoreMode, transformer: value.transformer ?? "", lightning: value.lightning ?? "" };
+  value = normalizedSettings(value);
+  const pairs = { denoise: value.denoise, steps: value.steps, passes: value.passes, seed: value.seed ?? "", sigma: value.restore_sigma, unsharp: value.unsharp, "restore-mode": value.restore_mode };
   for (const [id, item] of Object.entries(pairs)) $(id).value = item;
-  $("restore").checked = value.restore ?? true;
-  $("keep-intermediate").checked = value.keep_intermediate ?? false;
-  state.runtimeChoice = Object.fromEntries(["device", "offload", "precision"].map((field) => [field, typeof value[field] === "string" ? value[field] : "auto"]));
+  $("restore").checked = value.restore;
+  $("keep-intermediate").checked = value.keep_intermediate;
+  state.modelChoice = { transformer: value.transformer, lightning: value.lightning };
+  state.runtimeChoice = Object.fromEntries(["device", "offload", "precision"].map((field) => [field, value[field]]));
   refreshRuntimeControls();
   refreshControlValues();
+}
+
+function fillOptions(id, options, selected) {
+  const select = $(id);
+  select.replaceChildren();
+  for (const item of options) {
+    const option = document.createElement("option");
+    option.value = item.value;
+    option.textContent = item.label;
+    option.disabled = Boolean(item.disabled);
+    if (item.title) option.title = item.title;
+    select.appendChild(option);
+  }
+  if (!options.some((item) => item.value === selected)) {
+    const missing = document.createElement("option");
+    missing.value = selected;
+    missing.textContent = `Unavailable: ${String(selected).split("/").pop()}`;
+    missing.disabled = true;
+    select.appendChild(missing);
+  }
+  select.value = selected;
+}
+
+function renderSettingsDialog() {
+  const draft = state.settingsDraft || { ...state.modelChoice, ...state.runtimeChoice };
+  for (const [id, inventory, preferred] of [["transformer", state.models, state.models[0]?.path], ["lightning", state.lightningAdapters, state.defaultLightning]]) {
+    const automatic = inventory.find((item) => item.path === preferred);
+    fillOptions(id, [{ value: "", label: automatic ? `Automatic (${automatic.label || automatic.name})` : "No weights found" }, ...inventory.map((item) => ({ value: item.path, label: item.label || item.name, title: item.path }))], draft[id] || "");
+    $(id).disabled = state.busy || state.refreshing || !state.inventoryReady;
+  }
+  const ready = Boolean(state.runtime?.ready);
+  fillOptions("device-select", [{ value: "auto", label: ready ? `Auto (${state.runtime.default_device.toUpperCase()})` : "Detecting…" }, ...(state.runtime?.devices || []).map((item) => ({ value: item.id, label: item.type === "cuda" ? `${item.id.toUpperCase()} · ${item.name}` : item.name }))], draft.device);
+  const device = state.runtime?.devices.find((item) => item.id === (draft.device === "auto" ? state.runtime.default_device : draft.device));
+  for (const [field, modes, labels] of [
+    ["offload", device?.offload_modes, [["auto", "Auto"], ["sequential", "Sequential"], ["model", "Model"], ["none", "Disabled"]]],
+    ["precision", device?.precisions, [["auto", "Auto"], ["bfloat16", "BF16"], ["float32", "FP32"]]],
+  ]) fillOptions(`${field}-select`, labels.map(([value, label]) => ({ value, label: value !== "auto" && !modes?.includes(value) && value === draft[field] ? `Unavailable: ${label}` : label, disabled: value !== "auto" && !modes?.includes(value) })), draft[field]);
+  for (const field of ["device", "offload", "precision"]) $(`${field}-select`).disabled = state.busy || state.refreshing || !ready;
+  const problem = state.settingsDraft ? configurationProblem(state.settingsDraft) : "";
+  $("save-settings").disabled = !state.settingsDraft || state.busy || state.refreshing || Boolean(problem);
+  $("refresh-settings").disabled = state.busy || state.refreshing;
+  $("refresh-settings").textContent = state.refreshing ? "Refreshing…" : "Refresh";
+  setText("settings-message", problem);
+  $("settings-message").hidden = !problem;
+  updatePresetButtons();
+}
+
+function openSettingsDialog() {
+  if (state.busy) return;
+  try { state.settingsDraft = normalizedSettings(settings()); }
+  catch (error) { toast(error.message, true); return; }
+  renderPresets("");
+  $("preset-name").value = "";
+  renderSettingsDialog();
+  $("settings-dialog").showModal();
+}
+
+function closeSettingsDialog() {
+  state.settingsDraft = null;
+  $("settings-dialog").close();
+  renderSettingsDialog();
+}
+
+function saveSettingsDialog() {
+  if (!state.settingsDraft || state.refreshing || state.busy) return;
+  try {
+    const value = normalizedSettings(state.settingsDraft);
+    const problem = configurationProblem(value);
+    if (problem) throw new Error(problem);
+    if (!persistSettings(value, true)) return;
+    const previous = settings();
+    applySettings(value);
+    state.dirty = true;
+    closeSettingsDialog();
+    updateCards();
+    if (["restore", "restore_sigma", "restore_mode", "unsharp"].some((key) => previous[key] !== value[key])) scheduleRestore();
+    toast("Settings saved");
+  } catch (error) { toast(error.message, true); }
+}
+
+function presetName(value) {
+  if (typeof value !== "string") throw new Error("Enter a preset name.");
+  const name = value.trim().replace(/\s+/gu, " ");
+  if (!name || name.length > 80) throw new Error("Preset name must contain 1–80 characters.");
+  return name;
+}
+
+function presetNameKey(value) { return presetName(value).normalize("NFKC").toLowerCase(); }
+
+function readPresets() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("desynth.presets.v1") || '{"version":1,"presets":[]}');
+    if (saved.version !== 1 || !Array.isArray(saved.presets)) throw new Error("Invalid preset storage.");
+    const ids = new Set();
+    const names = new Set();
+    let invalid = false;
+    state.presets = [];
+    for (const item of saved.presets) {
+      try {
+        if (!item || typeof item.id !== "string" || !item.id || ids.has(item.id) || !item.params || typeof item.params !== "object" || Array.isArray(item.params)) throw new Error("Invalid preset.");
+        const name = presetName(item.name);
+        const key = presetNameKey(name);
+        if (names.has(key)) throw new Error("Duplicate preset name.");
+        const params = normalizedSettings(item.params);
+        ids.add(item.id); names.add(key);
+        state.presets.push({ id: item.id, name, params });
+      } catch { invalid = true; }
+    }
+    if (invalid) toast("Skipped invalid saved presets.", true);
+  } catch { state.presets = []; toast("Could not read saved presets.", true); }
+}
+
+function persistPresets(presets) {
+  try { localStorage.setItem("desynth.presets.v1", JSON.stringify({ version: 1, presets })); return true; }
+  catch { toast("Could not save presets in this browser.", true); return false; }
+}
+
+function renderPresets(selected = $("preset-select").value) {
+  fillOptions("preset-select", [{ value: "", label: "Custom" }, ...state.presets.map((item) => ({ value: item.id, label: item.name }))], state.presets.some((item) => item.id === selected) ? selected : "");
+  updatePresetButtons();
+}
+
+function updatePresetButtons() {
+  const disabled = !state.settingsDraft || state.busy || state.refreshing;
+  $("preset-select").disabled = disabled;
+  $("preset-name").disabled = disabled;
+  $("save-preset").disabled = disabled;
+  $("delete-preset").disabled = disabled || !state.presets.some((item) => item.id === $("preset-select").value);
+}
+
+function selectPreset() {
+  const selected = state.presets.find((item) => item.id === $("preset-select").value);
+  if (!selected || !state.settingsDraft) { updatePresetButtons(); return; }
+  state.settingsDraft = normalizedSettings(selected.params);
+  $("preset-name").value = selected.name;
+  renderSettingsDialog();
+}
+
+function savePreset() {
+  if (!state.settingsDraft || state.busy || state.refreshing) return;
+  try {
+    const name = presetName($("preset-name").value);
+    const existing = state.presets.find((item) => presetNameKey(item.name) === presetNameKey(name));
+    const entry = { id: existing?.id || crypto.randomUUID(), name, params: normalizedSettings(state.settingsDraft) };
+    const presets = existing ? state.presets.map((item) => item.id === entry.id ? entry : item) : [...state.presets, entry];
+    if (!persistPresets(presets)) return;
+    state.presets = presets;
+    $("preset-name").value = name;
+    renderPresets(entry.id);
+    toast(existing ? "Preset updated" : "Preset saved");
+  } catch (error) { toast(error.message, true); }
+}
+
+function deletePreset() {
+  if (!state.settingsDraft || state.busy || state.refreshing) return;
+  const selected = $("preset-select").value;
+  if (!state.presets.some((item) => item.id === selected)) return;
+  const presets = state.presets.filter((item) => item.id !== selected);
+  if (!persistPresets(presets)) return;
+  state.presets = presets;
+  $("preset-name").value = "";
+  renderPresets("");
+  toast("Preset deleted");
 }
 
 function scheduleRestore() {
@@ -522,9 +748,11 @@ function busy(value) {
 }
 
 async function processImage() {
-  if (state.busy || !state.source || !state.runtime?.ready || !state.environmentReady) return;
+  if (state.busy || state.refreshing || state.settingsDraft || !state.source || !state.runtime?.ready || !state.environmentReady) return;
   try {
     const params = settings();
+    const problem = configurationProblem(params);
+    if (problem) throw new Error(problem);
     clearTimeout(restoreTimer);
     state.restoreVersion++;
     restoreController?.abort();
@@ -614,25 +842,37 @@ function bindEvents() {
   $("process-button").addEventListener("click", processImage);
   $("settings-form").addEventListener("submit", (event) => { event.preventDefault(); processImage(); });
   for (const field of ["device", "offload", "precision"]) $(`${field}-select`).addEventListener("change", () => {
-    state.runtimeChoice[field] = $(`${field}-select`).value;
-    refreshRuntimeControls();
-    refreshControlValues();
-    state.dirty = true;
+    if (!state.settingsDraft) return;
+    state.settingsDraft[field] = $(`${field}-select`).value;
+    renderSettingsDialog();
   });
-  for (const id of ["denoise", "steps", "passes", "seed", "transformer", "lightning", "keep-intermediate"]) $(id).addEventListener("input", () => {
-    refreshControlValues(); state.dirty = true;
+  for (const id of ["transformer", "lightning"]) $(id).addEventListener("change", () => {
+    if (!state.settingsDraft) return;
+    state.settingsDraft[id] = $(id).value || null;
+    renderSettingsDialog();
   });
-  for (const id of ["sigma", "unsharp", "restore-mode", "restore"]) $(id).addEventListener("input", () => { refreshControlValues(); scheduleRestore(); });
-  $("random-seed").addEventListener("click", () => { $("seed").value = crypto.getRandomValues(new Uint32Array(1))[0] % 2147483647; refreshControlValues(); state.dirty = true; });
-  $("reset-button").addEventListener("click", () => { applySettings({}); state.dirty = true; scheduleRestore(); toast("Parameters reset"); });
+  for (const id of ["denoise", "steps", "passes", "seed", "keep-intermediate"]) $(id).addEventListener("input", () => {
+    refreshControlValues(); persistLiveSettings(); state.dirty = true;
+  });
+  for (const id of ["sigma", "unsharp", "restore-mode", "restore"]) $(id).addEventListener("input", () => { refreshControlValues(); persistLiveSettings(); scheduleRestore(); });
+  $("random-seed").addEventListener("click", () => { $("seed").value = crypto.getRandomValues(new Uint32Array(1))[0] % 2147483647; refreshControlValues(); persistLiveSettings(); state.dirty = true; });
+  $("reset-button").addEventListener("click", () => { applySettings({ ...normalizedSettings({}), ...state.modelChoice, ...state.runtimeChoice }); persistLiveSettings(); state.dirty = true; scheduleRestore(); toast("Parameters reset"); });
   $("diff-gain").addEventListener("input", () => { refreshControlValues(); requestDraw(); });
   $("diff-channel").addEventListener("change", requestDraw);
-  $("settings-button").addEventListener("click", () => { if (!state.busy) $("settings-dialog").showModal(); });
-  $("close-settings").addEventListener("click", () => $("settings-dialog").close());
+  $("settings-button").addEventListener("click", openSettingsDialog);
+  $("close-settings").addEventListener("click", closeSettingsDialog);
+  $("cancel-settings").addEventListener("click", closeSettingsDialog);
+  $("save-settings").addEventListener("click", saveSettingsDialog);
+  $("refresh-settings").addEventListener("click", refreshInventory);
+  $("preset-select").addEventListener("change", selectPreset);
+  $("save-preset").addEventListener("click", savePreset);
+  $("delete-preset").addEventListener("click", deletePreset);
+  $("settings-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeSettingsDialog(); });
+  $("settings-dialog").addEventListener("close", () => { state.settingsDraft = null; renderSettingsDialog(); });
   $("settings-dialog").addEventListener("click", (event) => {
     if (event.target !== event.currentTarget) return;
     const bounds = event.currentTarget.getBoundingClientRect();
-    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) event.currentTarget.close();
+    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closeSettingsDialog();
   });
   $("help-button")?.addEventListener("click", () => $("help-dialog").showModal());
   $("close-help")?.addEventListener("click", () => $("help-dialog").close());
@@ -658,37 +898,26 @@ async function initialize() {
   bindEvents();
   let saved = {};
   let selection = {};
-  try { saved = JSON.parse(localStorage.getItem("desynth.settings.v1") || "{}"); } catch { /* Use defaults. */ }
+  try { saved = JSON.parse(localStorage.getItem("desynth.settings.v1") || "{}"); normalizedSettings(saved); }
+  catch { saved = {}; toast("Could not read saved settings. Using defaults.", true); }
   try { selection = JSON.parse(localStorage.getItem("desynth.selection.v1") || "{}"); } catch { /* Use project defaults. */ }
+  readPresets();
+  renderPresets("");
   applySettings(saved);
   updateCards();
   try {
     const session = await connectToServer();
-    state.environmentReady = Boolean(session.ready);
     defaults.steps = session.default_steps || 8;
-    for (const [id, inventory, preferred] of [["transformer", session.models, session.models?.[0]?.path], ["lightning", session.lightning_adapters, session.default_lightning]]) {
-      const select = $(id);
-      const automatic = select.options[0];
-      const defaultItem = inventory?.find((item) => item.path === preferred);
-      automatic.textContent = defaultItem ? `Automatic (${defaultItem.label || defaultItem.name})` : "No weights found";
-      for (const item of inventory || []) {
-        const option = document.createElement("option");
-        option.value = item.path;
-        option.textContent = item.label || item.name;
-        option.title = item.path;
-        select.appendChild(option);
-      }
-      if (saved[id]) {
-        const normalized = String(saved[id]).replaceAll("\\", "/");
-        const match = inventory?.find((item) => item.path === normalized) || inventory?.find((item) => item.name === normalized.split("/").pop());
-        saved[id] = match?.path || "";
-        if (!match) toast(`The saved ${id === "lightning" ? "Lightning adapter" : "model"} is unavailable. Using Automatic.`);
-      }
+    // Migrate old bare filenames while preserving unavailable explicit selections.
+    for (const [id, inventory] of [["transformer", session.models], ["lightning", session.lightning_adapters]]) {
+      if (!saved[id]) continue;
+      const normalized = saved[id].replaceAll("\\", "/");
+      const match = inventory?.find((item) => item.path === normalized) || (!normalized.includes("/") ? inventory?.find((item) => item.name === normalized) : null);
+      saved[id] = match?.path || normalized;
     }
-    state.inventoryReady = true;
     applySettings(saved);
-    updateRuntimeInventory(session.runtime);
-    if (!session.runtime?.ready) detectRuntime();
+    syncInventory(session);
+    if (!session.runtime?.ready || session.runtime?.refreshing) detectRuntime().catch((error) => toast(error.message, true));
     setText("model-label", session.models?.[0]?.name || "No models found");
     const activeJob = session.active_job_id ? await api(`/api/job/${session.active_job_id}`) : null;
     const source = session.assets?.find((asset) => asset.id === (activeJob?.source_id || selection.source)) || session.assets?.find((asset) => asset.id === session.default_source_id);

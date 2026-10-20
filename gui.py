@@ -41,8 +41,12 @@ def model_inventory(root):
         if not directory.is_dir():
             continue
         for path in sorted(directory.iterdir()):
-            if path.is_file() and path.stat().st_size > 0 and path.name.lower() not in found:
-                found[path.name.lower()] = path
+            try:
+                if path.is_file() and path.stat().st_size > 0 and path.name.lower() not in found:
+                    found[path.name.lower()] = path
+            except FileNotFoundError:
+                # A user can move weights while Refresh scans the directory.
+                continue
     models, adapters = [], []
     for path in found.values():
         item = {"name": path.name, "path": path.relative_to(root).as_posix()}
@@ -71,11 +75,16 @@ def weight_identity(path):
 
 def automatic_model_paths(models, root):
     """Keep the preferred model first; OOM retries only use smaller weight files."""
-    if not models:
+    available = []
+    for item in models:
+        try:
+            available.append((item["path"], (root / item["path"]).stat().st_size))
+        except FileNotFoundError:
+            continue
+    if not available:
         return []
-    preferred = models[0]["path"]
-    preferred_size = (root / preferred).stat().st_size
-    smaller = [(item["path"], (root / item["path"]).stat().st_size) for item in models[1:]]
+    preferred, preferred_size = available[0]
+    smaller = available[1:]
     return [preferred] + [path for path, size in sorted(smaller, key=lambda item: item[1], reverse=True)
                           if size < preferred_size]
 
@@ -155,8 +164,9 @@ class Studio:
         self.active = None
         self.pipe = self.pipe_path = self.pipe_key = self.embeds = self.module = None
         self.device = "Detecting device…"
-        self.runtime = {"ready": False, "devices": [{"id": "cpu", "name": "CPU", "type": "cpu",
+        self.runtime = {"ready": False, "refreshing": False, "devices": [{"id": "cpu", "name": "CPU", "type": "cpu",
                          "precisions": ["float32"], "offload_modes": ["none"]}], "default_device": "cpu"}
+        self.runtime_probe_running = False
         self.models, self.lightning_adapters = model_inventory(ROOT)
         self.default_lightning = self.lightning_adapters[0]["path"] if self.lightning_adapters else None
         self.default_steps = 32 if self.lightning_adapters and self.lightning_adapters[0]["steps"] == 8 else 8
@@ -173,17 +183,46 @@ class Studio:
                     self.default_result = asset["id"]
             except (OSError, ValueError, Image.DecompressionBombError):
                 continue
-        threading.Thread(target=self.probe_device, daemon=True).start()
+        self.start_runtime_probe()
+
+    def start_runtime_probe(self):
+        """Refresh capabilities without unloading the pipeline or changing a job."""
+        with self.lock:
+            if self.runtime_probe_running:
+                return
+            self.runtime_probe_running = True
+            self.runtime = {**self.runtime, "refreshing": True}
+        threading.Thread(target=self._probe_runtime, daemon=True).start()
+
+    def _probe_runtime(self):
+        try:
+            self.probe_device()
+        finally:
+            with self.lock:
+                self.runtime = {**self.runtime, "refreshing": False}
+                self.runtime_probe_running = False
+
+    def refresh(self):
+        models, adapters = model_inventory(ROOT)
+        with self.lock:
+            self.models, self.lightning_adapters = models, adapters
+            self.default_lightning = adapters[0]["path"] if adapters else None
+            self.default_steps = 32 if adapters and adapters[0]["steps"] == 8 else 8
+        self.start_runtime_probe()
+        return self.state()
 
     def probe_device(self):
+        devices = [{"id": "cpu", "name": "CPU", "type": "cpu", "precisions": ["float32"], "offload_modes": ["none"]}]
         try:
             probe = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=5)
-            self.device = f"{probe.stdout.strip().splitlines()[0]} · checking CUDA" if probe.returncode == 0 and probe.stdout.strip() else "Checking device…"
+            pending = f"{probe.stdout.strip().splitlines()[0]} · checking CUDA" if probe.returncode == 0 and probe.stdout.strip() else "Checking device…"
         except (OSError, subprocess.TimeoutExpired):
-            self.device = "Checking device…"
+            pending = "Checking device…"
+        with self.lock:
+            if not self.runtime["ready"]:
+                self.device = pending
         try:
             import torch
-            devices = list(self.runtime["devices"])
             if torch.cuda.is_available():
                 for index in range(torch.cuda.device_count()):
                     with torch.cuda.device(index):
@@ -203,11 +242,13 @@ class Studio:
                                 "offload_modes": ["model", "none"]})
             default = next((d for d in devices if d["type"] == "cuda"), next((d for d in devices if d["type"] == "mps"), devices[0]))
             with self.lock:
-                self.runtime = {"ready": True, "devices": devices, "default_device": default["id"]}
+                self.runtime = {"ready": True, "refreshing": self.runtime.get("refreshing", False),
+                                "devices": devices, "default_device": default["id"]}
                 self.device = f"{default['type'].upper()} · {default['name']}" if default["type"] != "cpu" else "CPU"
         except Exception as exc:
             with self.lock:
-                self.runtime = {**self.runtime, "ready": True, "error": str(exc)}
+                self.runtime = {"ready": True, "refreshing": self.runtime.get("refreshing", False),
+                                "devices": devices[:1], "default_device": "cpu", "error": str(exc)}
                 self.device = "CPU"
 
     def resolve_runtime(self, params):
@@ -264,13 +305,13 @@ class Studio:
         return self.register(path, kind, name)
 
     def state(self):
-        missing = [] if embeddings_path(ROOT).is_file() else ["embeds_cache.pt"]
-        if not self.models:
-            missing.append("GGUF transformer")
-        if not self.lightning_adapters:
-            missing.append("Lightning adapter")
-        missing += [name for name in ("torch", "diffusers", "numpy", "cv2", "skimage") if importlib.util.find_spec(name) is None]
         with self.lock:
+            missing = [] if embeddings_path(ROOT).is_file() else ["embeds_cache.pt"]
+            if not self.models:
+                missing.append("GGUF transformer")
+            if not self.lightning_adapters:
+                missing.append("Lightning adapter")
+            missing += [name for name in ("torch", "diffusers", "numpy", "cv2", "skimage") if importlib.util.find_spec(name) is None]
             return dict(device=self.device, ready=not missing, models=self.models, lightning_adapters=self.lightning_adapters,
                         default_lightning=self.default_lightning, default_steps=self.default_steps, assets=list(self.assets.values()),
                         default_source_id=self.default_source, default_result_id=self.default_result,
@@ -348,29 +389,34 @@ class Studio:
     def process(self, payload):
         source_id = payload.get("source_id")
         self.asset(source_id, "source")
-        raw_params = payload.get("params", {})
-        preferred = next((item for item in self.lightning_adapters if isinstance(raw_params, dict) and item["path"] == raw_params.get("lightning")), None)
-        default_steps = (32 if preferred["steps"] == 8 else 8) if preferred else self.default_steps
-        params = parameters(raw_params, process=True, default_steps=default_steps)
-        runtime = self.resolve_runtime(params)
-        requested = params["transformer"]
-        if requested is not None and requested not in [model["path"] for model in self.models]:
-            raise APIError("Select a GGUF model from the available models.")
-        adapter = params["lightning"] if params["lightning"] is not None else self.default_lightning
-        selected = next((item for item in self.lightning_adapters if item["path"] == adapter), None)
-        if selected is None:
-            raise APIError("Select a Lightning adapter from the available adapters.")
-        if not (ROOT / selected["path"]).is_file():
-            raise APIError("The selected Lightning adapter was moved or removed. Restart the server to refresh available models.")
-        params["lightning"] = selected["path"]
-        if not self.state()["ready"]:
-            raise APIError("Environment is not ready. Run make setup; check GGUF and Lightning weights in ai/ and embeds_cache.pt.", 503)
-        if params["seed"] is None:
-            params["seed"] = secrets.randbits(31)
-        job_id = secrets.token_hex(16)
         with self.lock:
             if self.active:
                 raise APIError("Processing is already running. Wait for the current job to finish.", 409)
+            raw_params = payload.get("params", {})
+            preferred = next((item for item in self.lightning_adapters if isinstance(raw_params, dict) and item["path"] == raw_params.get("lightning")), None)
+            default_steps = (32 if preferred["steps"] == 8 else 8) if preferred else self.default_steps
+            params = parameters(raw_params, process=True, default_steps=default_steps)
+            runtime = self.resolve_runtime(params)
+            requested = params["transformer"]
+            if requested is not None and requested not in [model["path"] for model in self.models]:
+                raise APIError("Select a GGUF model from the available models. Use Refresh in Settings to update the list.")
+            adapter = params["lightning"] if params["lightning"] is not None else self.default_lightning
+            selected = next((item for item in self.lightning_adapters if item["path"] == adapter), None)
+            if selected is None:
+                raise APIError("Select a Lightning adapter from the available adapters. Use Refresh in Settings to update the list.")
+            if not (ROOT / selected["path"]).is_file():
+                raise APIError("The selected Lightning adapter was moved or removed. Use Refresh in Settings to update the list.")
+            params["lightning"] = selected["path"]
+            candidates = [requested] if requested else automatic_model_paths(self.models, ROOT)
+            if not candidates or any(not (ROOT / path).is_file() for path in candidates):
+                raise APIError("The selected GGUF model was moved or removed. Use Refresh in Settings to update the list.")
+            # A concurrent refresh must not change an accepted job's fallback order.
+            params["_model_candidates"] = candidates
+            if not self.state()["ready"]:
+                raise APIError("Environment is not ready. Run make setup; check GGUF and Lightning weights in ai/ and embeds_cache.pt.", 503)
+            if params["seed"] is None:
+                params["seed"] = secrets.randbits(31)
+            job_id = secrets.token_hex(16)
             job = dict(id=job_id, status="queued", progress=0, stage="Queued", elapsed=0,
                        seed=params["seed"], source_id=source_id, result=None, clean=None, metrics=None, error=None)
             job.update(runtime=runtime, requested_runtime={key: params[key] for key in ("device", "offload", "precision")})
@@ -413,7 +459,7 @@ class Studio:
             for key in ("prompt_embeds", "negative_prompt_embeds", "prompt_embeds_mask", "negative_prompt_embeds_mask"):
                 value = self.embeds[key]
                 embeds[key] = value.to(device=runtime["device"], dtype=dtype if value.is_floating_point() else value.dtype)
-            candidates = [params["transformer"]] if params["transformer"] else automatic_model_paths(self.models, ROOT)
+            candidates = params["_model_candidates"]
             clean = None
             for candidate in candidates:
                 try:
@@ -609,6 +655,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise APIError("A JSON object is required.")
             path = urlsplit(self.path).path
+            if path == "/api/refresh":
+                return self.send_json(200, self.studio.refresh())
             if path == "/api/upload":
                 return self.send_json(200, self.studio.upload(payload))
             if path == "/api/process":

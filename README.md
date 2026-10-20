@@ -191,10 +191,22 @@ may be loaded automatically when available. View modes and zoom are available in
 
 Open **Settings** in the bottom toolbar to choose the **Model**, **Lightning adapter**,
 **Device**, **CPU offload**, and **Precision**.
-These settings apply when you next click
+Click **Refresh** to rescan `ai/` and the repository root, and recheck available
+devices, precision and offload modes without restarting the server. The current
+images and processing job stay in place. If a selected model or device disappears,
+choose an available option before saving.
+
+Click **Save settings** to apply and remember changes. **Cancel**, the close button,
+and Escape discard unsaved changes. These settings apply when you next click
 **Process**. The pipeline reloads when the effective configuration changes;
 the job status shows the settings actually used. Available choices follow the
 detected hardware.
+
+Use **Preset** to stage a saved configuration, then **Save settings** to apply it.
+Enter a **Preset name** and click **Save preset** to store the current generation,
+restoration, model and runtime parameters. Saving the same name updates that preset;
+**Delete** removes the selected preset. Settings and presets are stored in this
+browser and remain available after a server restart.
 
 | setting | choices and effect |
 |---------|--------------------|
