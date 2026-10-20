@@ -13,12 +13,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MODEL_DIR = ROOT / "ai"
 QWEN_REPO = "Qwen/Qwen-Image"
-GGUF_NAMES = (
-    "Qwen-Image-2512-Q4_K_M.gguf",
-    "qwen-image-2512-Q4_K_M.gguf",
-    "Qwen-Image-2512-Q2_K_M.gguf",
-    "qwen-image-2512-Q2_K_M.gguf",
-)
+GGUF_MODELS = {
+    "q4": ("Qwen-Image-2512-Q4_K_M.gguf", "qwen-image-2512-Q4_K_M.gguf"),
+    "q8": ("Qwen-Image-2512-Q8_0.gguf", "qwen-image-2512-Q8_0.gguf"),
+}
 CACHE_FILES = (
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -83,6 +81,34 @@ def installed_gguf() -> Path | None:
     return None
 
 
+def selected_gguf(model: str) -> Path | None:
+    if model == "auto":
+        return installed_gguf()
+    return next((find_asset(name) for name in GGUF_MODELS[model] if present(name)), None)
+
+
+def choose_download_model(model: str) -> str:
+    """Ask only for an unspecified, missing GGUF on an interactive terminal."""
+    if model != "auto":
+        return model
+    if sys.stdin is None or not sys.stdin.isatty():
+        return "q4"
+    print("Choose a GGUF model to download:\n"
+          "  1. Q4_K_M (~13 GB) - lower memory use [default]\n"
+          "  2. Q8_0 (~21.8 GB) - higher memory use", flush=True)
+    while True:
+        try:
+            choice = input("Choice [1]: ").strip().casefold()
+        except (EOFError, OSError):
+            print("Using Q4_K_M.", flush=True)
+            return "q4"
+        if choice in ("", "1", "q4", "q4_k_m"):
+            return "q4"
+        if choice in ("2", "q8", "q8_0"):
+            return "q8"
+        print("Enter 1 for Q4_K_M or 2 for Q8_0.", flush=True)
+
+
 def lightning_candidates(choice: str) -> tuple[str, ...]:
     steps = (8, 4) if choice == "auto" else (int(choice),)
     return tuple(f"Qwen-Image-2512-Lightning-{count}steps-V1.0-{precision}.safetensors"
@@ -94,12 +120,15 @@ def require_embeds() -> None:
         raise RuntimeError("Missing embeds_cache.pt in ai/ or the repository root. Restore the included file.")
 
 
-def download_models(lightning: str = "auto") -> None:
+def download_models(lightning: str = "auto", model: str = "auto") -> None:
     from huggingface_hub import HfApi, hf_hub_download
 
     require_embeds()
+    gguf = selected_gguf(model)
+    if gguf is None:
+        model = choose_download_model(model)
     models = (
-        ("Frederic75/Qwen-Image-2512-GGUF", GGUF_NAMES[:2], installed_gguf()),
+        ("Frederic75/Qwen-Image-2512-GGUF", GGUF_MODELS["q4" if model == "auto" else model], gguf),
         ("lightx2v/Qwen-Image-2512-Lightning", lightning_candidates(lightning),
          next((find_asset(name) for name in lightning_candidates(lightning) if present(name)), None)),
     )
@@ -141,7 +170,7 @@ def prepare() -> None:
     print("VAE and configs are cached; transformer/text encoder weights were not requested.", flush=True)
 
 
-def doctor(backend: str, lightning: str = "auto") -> None:
+def doctor(backend: str, lightning: str = "auto", model: str = "auto") -> None:
     print(f"Python {sys.version.split()[0]}: {sys.executable}")
     print(f"Dependency backend: {backend}")
     failures = []
@@ -179,9 +208,9 @@ def doctor(backend: str, lightning: str = "auto") -> None:
             print(f"Device: {'MPS' if torch.backends.mps.is_available() else 'CPU'}")
     except Exception as exc:
         failures.append(f"PyTorch device check: {exc}")
-    gguf = installed_gguf()
+    gguf = selected_gguf(model)
     if gguf is None:
-        failures.append("Missing GGUF model. Run make models.")
+        failures.append(f"Missing GGUF model ({model}). Run make models MODEL={model}.")
     else:
         print(f"GGUF: {gguf}")
     adapter = next((find_asset(name) for name in lightning_candidates(lightning) if present(name)), None)
@@ -206,17 +235,17 @@ def doctor(backend: str, lightning: str = "auto") -> None:
     print("Ready: dependencies, device, model files, and VAE/config cache are available.", flush=True)
 
 
-def worker(command: str, directory: Path, backend: str, lightning: str = "auto") -> None:
+def worker(command: str, directory: Path, backend: str, lightning: str = "auto", model: str = "auto") -> None:
     # Compare prefixes, not executable paths: POSIX venv interpreters can be symlinks.
     if Path(sys.prefix).resolve() != directory:
         run(str(require_env(directory)), str(Path(__file__).resolve()), command,
-            "--venv", str(directory), "--backend", backend, "--lightning", lightning)
+            "--venv", str(directory), "--backend", backend, "--lightning", lightning, "--model", model)
     elif command == "models":
-        download_models(lightning)
+        download_models(lightning, model)
     elif command == "prepare":
         prepare()
     else:
-        doctor(backend, lightning)
+        doctor(backend, lightning, model)
 
 
 def main() -> None:
@@ -224,6 +253,8 @@ def main() -> None:
     parser.add_argument("command", choices=("help", "venv", "install", "models", "prepare", "doctor", "setup"))
     parser.add_argument("--venv", type=Path, default=Path(".venv"))
     parser.add_argument("--backend", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--model", choices=("auto", "q4", "q8"), default="auto",
+                        help="GGUF to prepare/check; auto reuses installed weights, otherwise asks in a terminal (Q4 default)")
     parser.add_argument("--lightning", choices=("auto", "4", "8"), default="auto",
                         help="adapter to prepare/check; auto reuses 8-step, then 4-step, or downloads 8-step FP32")
     args = parser.parse_args()
@@ -248,9 +279,9 @@ def main() -> None:
         elif args.command == "setup":
             install(directory, backend)
             for command in ("models", "prepare", "doctor"):
-                worker(command, directory, backend, args.lightning)
+                worker(command, directory, backend, args.lightning, args.model)
         else:
-            worker(args.command, directory, backend, args.lightning)
+            worker(args.command, directory, backend, args.lightning, args.model)
     except subprocess.CalledProcessError as exc:
         raise SystemExit(exc.returncode) from exc
     except Exception as exc:
