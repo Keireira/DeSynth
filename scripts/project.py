@@ -11,6 +11,7 @@ import venv
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+MODEL_DIR = ROOT / "ai"
 QWEN_REPO = "Qwen/Qwen-Image"
 GGUF_NAMES = (
     "Qwen-Image-2512-Q4_K_M.gguf",
@@ -18,7 +19,6 @@ GGUF_NAMES = (
     "Qwen-Image-2512-Q2_K_M.gguf",
     "qwen-image-2512-Q2_K_M.gguf",
 )
-LORA_NAME = "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors"
 CACHE_FILES = (
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -64,36 +64,58 @@ def install(directory: Path, backend: str) -> None:
 
 
 def present(name: str) -> bool:
-    path = ROOT / name
-    return path.is_file() and path.stat().st_size > 0
+    return find_asset(name) is not None
+
+
+def find_asset(name: str) -> Path | None:
+    """Prefer ai/, retaining compatibility with existing root-level assets."""
+    return next((path for path in (MODEL_DIR / name, ROOT / name)
+                 if path.is_file() and path.stat().st_size > 0), None)
+
+
+def installed_gguf() -> Path | None:
+    for directory in (MODEL_DIR, ROOT):
+        if directory.is_dir():
+            found = next((path for path in sorted(directory.glob("*.gguf"))
+                          if path.is_file() and path.stat().st_size > 0), None)
+            if found is not None:
+                return found
+    return None
+
+
+def lightning_candidates(choice: str) -> tuple[str, ...]:
+    steps = (8, 4) if choice == "auto" else (int(choice),)
+    return tuple(f"Qwen-Image-2512-Lightning-{count}steps-V1.0-{precision}.safetensors"
+                 for count in steps for precision in ("fp32", "bf16"))
 
 
 def require_embeds() -> None:
     if not present("embeds_cache.pt"):
-        raise RuntimeError("Missing embeds_cache.pt. Restore the included file from the repository.")
+        raise RuntimeError("Missing embeds_cache.pt in ai/ or the repository root. Restore the included file.")
 
 
-def download_models() -> None:
+def download_models(lightning: str = "auto") -> None:
     from huggingface_hub import HfApi, hf_hub_download
 
     require_embeds()
     models = (
-        ("Frederic75/Qwen-Image-2512-GGUF", GGUF_NAMES[:2]),
-        ("lightx2v/Qwen-Image-2512-Lightning", (LORA_NAME,)),
+        ("Frederic75/Qwen-Image-2512-GGUF", GGUF_NAMES[:2], installed_gguf()),
+        ("lightx2v/Qwen-Image-2512-Lightning", lightning_candidates(lightning),
+         next((find_asset(name) for name in lightning_candidates(lightning) if present(name)), None)),
     )
-    for repo, names in models:
-        existing = next((name for name in names if present(name)), None)
+    for repo, names, existing in models:
         if existing:
             print(f"Already present: {existing}", flush=True)
             continue
         # Resolve the upstream spelling rather than assuming filename case.
         available = HfApi().list_repo_files(repo_id=repo)
-        expected = {name.casefold() for name in names}
-        filename = next((name for name in available if name.casefold() in expected), None)
+        by_name = {name.casefold(): name for name in available}
+        filename = next((by_name[name.casefold()] for name in names if name.casefold() in by_name), None)
         if filename is None:
             raise RuntimeError(f"Cannot find {names[0]} in {repo}.")
         print(f"Downloading {repo}/{filename}", flush=True)
-        hf_hub_download(repo_id=repo, filename=filename, local_dir=str(ROOT))
+        MODEL_DIR.mkdir(exist_ok=True)
+        hf_hub_download(repo_id=repo, filename=filename, local_dir=str(MODEL_DIR))
     print("Model files are ready.", flush=True)
 
 

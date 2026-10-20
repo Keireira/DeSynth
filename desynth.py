@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
+import re
 import warnings
 from pathlib import Path
 
@@ -79,25 +81,31 @@ _patch_gguf_param()
 
 from diffusers import (
     AutoencoderKLQwenImage,
+    FlowMatchEulerDiscreteScheduler,
     GGUFQuantizationConfig,
     QwenImageImg2ImgPipeline,
     QwenImageTransformer2DModel,
 )
 from diffusers.utils import load_image
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent
+AI_DIR = ROOT / "ai"
 DEFAULT_INPUT = ROOT / "Original.png"
 OUT_DIR = ROOT / "out"
 
-# Ordered list of GGUF quants to try, best quality first.
+# Keep the memory-tested Q4 default; larger quants remain an explicit choice.
 # Each entry is (label, [candidate paths]) — first existing path wins per entry.
 # On OOM the pipeline tears down and retries with the next entry automatically.
 GGUF_FALLBACK_CHAIN: list[tuple[str, list[Path]]] = [
     ("Q4_K_M (~13 GB)", [
+        AI_DIR / "Qwen-Image-2512-Q4_K_M.gguf",
+        AI_DIR / "qwen-image-2512-Q4_K_M.gguf",
         ROOT / "Qwen-Image-2512-Q4_K_M.gguf",
         ROOT / "qwen-image-2512-Q4_K_M.gguf",   # README-suggested lowercase
     ]),
     ("Q2_K_M (~7 GB)", [
+        AI_DIR / "Qwen-Image-2512-Q2_K_M.gguf",
+        AI_DIR / "qwen-image-2512-Q2_K_M.gguf",
         ROOT / "Qwen-Image-2512-Q2_K_M.gguf",
         ROOT / "qwen-image-2512-Q2_K_M.gguf",
     ]),
@@ -105,15 +113,75 @@ GGUF_FALLBACK_CHAIN: list[tuple[str, list[Path]]] = [
 
 def _resolve_gguf(candidates: list[Path]) -> Path | None:
     """Return the first path in candidates that exists on disk, or None."""
-    return next((p for p in candidates if p.exists()), None)
+    return next((p for p in candidates if _nonempty_file(p)), None)
+
+
+def _nonempty_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def resolve_model_path(path: str | Path) -> Path:
+    """Resolve bare model filenames in ai/ first, retaining legacy root files."""
+    path = Path(path).expanduser()
+    if path.is_absolute():
+        return path
+    if len(path.parts) == 1:
+        return next((base / path for base in (AI_DIR, ROOT) if _nonempty_file(base / path)), AI_DIR / path)
+    return path.resolve() if path.is_file() else ROOT / path
+
+
+def discover_gguf_models() -> list[Path]:
+    """Find all local GGUFs, preferring ai/ when a filename exists twice."""
+    paths: dict[str, Path] = {}
+    for base in (AI_DIR, ROOT):
+        for path in sorted(base.glob("*.gguf")):
+            if _nonempty_file(path):
+                paths.setdefault(path.name.lower(), path)
+    return sorted(paths.values(), key=lambda p: (
+        0 if "q4_k_m" in p.name.lower() else 1 if "q2_k_m" in p.name.lower() else 2,
+        p.parent != AI_DIR, p.name.lower(),
+    ))
+
+
+def discover_lightning_loras() -> list[Path]:
+    """List local Qwen-Image-2512 Lightning adapters, newest step profile first."""
+    paths: dict[str, Path] = {}
+    for base in (AI_DIR, ROOT):
+        for path in sorted(base.glob("*.safetensors")):
+            if (_nonempty_file(path) and "qwen-image-2512-lightning-" in path.name.lower()
+                    and lightning_steps(path) in (4, 8)):
+                paths.setdefault(path.name.lower(), path)
+    return sorted(paths.values(), key=lambda p: (
+        lightning_steps(p) != 8, "fp32" not in p.name.lower(), p.parent != AI_DIR, p.name.lower(),
+    ))
+
+
+def lightning_steps(path: str | Path) -> int | None:
+    """Return the advertised training profile, not the img2img step count."""
+    match = re.search(r"-(4|8)steps(?:-|\.|$)", Path(path).name, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def default_steps_for_lightning(path: str | Path) -> int:
+    """Total schedule at default strength: 8 actual steps for the 8-step LoRA."""
+    return 32 if lightning_steps(path) == 8 else 8
+
+
+def effective_img2img_steps(steps: int, denoise: float) -> int:
+    """Match QwenImageImg2ImgPipeline.get_timesteps, including its rounding."""
+    initial = min(steps * denoise, steps)
+    return steps - int(max(steps - initial, 0))
 
 # Default transformer = best available quant right now (used by --transformer default).
 GGUF_TRANSFORMER = next(
-    (p for _, cands in GGUF_FALLBACK_CHAIN for p in cands if p.exists()),
-    GGUF_FALLBACK_CHAIN[0][1][0],  # fallback to first path even if missing (gives clear error)
+    (p for _, cands in GGUF_FALLBACK_CHAIN for p in cands if _nonempty_file(p)),
+    next(iter(discover_gguf_models()), GGUF_FALLBACK_CHAIN[0][1][0]),
 )
-LIGHTNING_LORA = ROOT / "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors"
-EMBEDS_CACHE = ROOT / "embeds_cache.pt"
+LIGHTNING_LORA = next(iter(discover_lightning_loras()),
+                      AI_DIR / "Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors")
+DEFAULT_LIGHTNING_SCALE = 0.8
+EMBEDS_CACHE = next((base / "embeds_cache.pt" for base in (AI_DIR, ROOT)
+                    if _nonempty_file(base / "embeds_cache.pt")), ROOT / "embeds_cache.pt")
 
 
 def _is_oom(exc: BaseException) -> bool:
