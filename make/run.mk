@@ -4,7 +4,7 @@ gui: | venv
 	"$(VENV_PYTHON)" gui.py --port "$(PORT)" $(GUI_ARGS)
 
 run: | venv
-	"$(VENV_PYTHON)" desynth.py "$(INPUT)" $(ARGS)
+	"$(VENV_PYTHON)" desynth.py "$(INPUT)" $(if $(LIGHTNING_LORA),--lightning "$(LIGHTNING_LORA)") --lightning-scale "$(LIGHTNING_SCALE)" $(ARGS)
 
 compare: | venv
 	"$(VENV_PYTHON)" compare.py "$(INPUT)" "$(OUTPUT)"
