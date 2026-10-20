@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-import gc
 import importlib.util
 import io
 import ipaddress
@@ -19,11 +18,16 @@ import threading
 import time
 import traceback
 import webbrowser
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from PIL import Image, ImageOps, UnidentifiedImageError
+from model_catalog import (automatic_model_paths, default_steps_for_lightning,
+                           discover_adapters, discover_models, effective_img2img_steps,
+                           embeddings_path, lightning_steps)
+from processing import finish_image, prepare_image
 
 ROOT = Path(__file__).resolve().parent
 STORE = ROOT / "out" / "gui"
@@ -31,62 +35,30 @@ WEB = ROOT / "web"
 MAX_BODY = 48 * 1024 * 1024
 MAX_IMAGE = 32 * 1024 * 1024
 MAX_PIXELS = 36_000_000
+MAX_ASSETS = 128
+MAX_TEMP_ASSETS = 48
+MAX_TEMP_BYTES = 512 * 1024 * 1024
+MAX_JOBS = 16
+MAX_RESTORE_CLIENTS = 8
 Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 
 
 def model_inventory(root):
-    """Find local weights in ai/, retaining legacy files in the project root."""
-    found = {}
-    for directory in (root / "ai", root):
-        if not directory.is_dir():
-            continue
-        for path in sorted(directory.iterdir()):
-            try:
-                if path.is_file() and path.stat().st_size > 0 and path.name.lower() not in found:
-                    found[path.name.lower()] = path
-            except FileNotFoundError:
-                # A user can move weights while Refresh scans the directory.
-                continue
-    models, adapters = [], []
-    for path in found.values():
-        item = {"name": path.name, "path": path.relative_to(root).as_posix()}
-        if path.suffix.lower() == ".gguf":
-            models.append(item)
-        elif path.suffix.lower() == ".safetensors" and "qwen-image-2512-lightning-" in path.name.lower():
-            match = re.search(r"-(4|8)steps-", path.name, re.IGNORECASE)
-            if match:
-                steps = int(match.group(1))
-                precision = "FP32" if "fp32" in path.name.lower() else "BF16" if "bf16" in path.name.lower() else ""
-                adapters.append({**item, "steps": steps, "label": f"{steps} steps" + (f" · {precision}" if precision else "")})
-    models.sort(key=lambda item: ("Q4" not in item["name"].upper(), item["name"]))
-    adapters.sort(key=lambda item: (item["steps"] != 8, "fp32" not in item["name"].lower(), item["name"]))
-    return models, adapters
-
-
-def embeddings_path(root):
-    return next((path for path in (root / "ai" / "embeds_cache.pt", root / "embeds_cache.pt") if path.is_file()), root / "ai" / "embeds_cache.pt")
+    def item(path):
+        return {"name": path.name, "path": path.relative_to(root).as_posix()}
+    adapters = []
+    for path in discover_adapters(root):
+        steps = lightning_steps(path)
+        precision = "FP32" if "fp32" in path.name.lower() else "BF16" if "bf16" in path.name.lower() else ""
+        adapters.append({**item(path), "steps": steps,
+                         "label": f"{steps} steps" + (f" · {precision}" if precision else "")})
+    return [item(path) for path in discover_models(root)], adapters
 
 
 def weight_identity(path):
     """Replacing a weight file at the same path must reload the pipeline."""
     info = path.stat()
     return str(path.resolve()), info.st_size, info.st_mtime_ns
-
-
-def automatic_model_paths(models, root):
-    """Keep the preferred model first; OOM retries only use smaller weight files."""
-    available = []
-    for item in models:
-        try:
-            available.append((item["path"], (root / item["path"]).stat().st_size))
-        except FileNotFoundError:
-            continue
-    if not available:
-        return []
-    preferred, preferred_size = available[0]
-    smaller = available[1:]
-    return [preferred] + [path for path, size in sorted(smaller, key=lambda item: item[1], reverse=True)
-                          if size < preferred_size]
 
 
 class APIError(Exception):
@@ -137,7 +109,7 @@ def parameters(raw, process=False, default_steps=8):
             raise APIError("precision must be auto, bfloat16, float16 or float32.")
         if result["seed"] is not None:
             result["seed"] = number(result["seed"], "seed", 0, 2**63 - 9, True)
-        if result["steps"] - int(max(result["steps"] - min(result["steps"] * result["denoise"], result["steps"]), 0)) < 1:
+        if effective_img2img_steps(result["steps"], result["denoise"]) < 1:
             raise APIError("These settings produce no processing steps. Increase steps or denoise.")
         for field in ("preview", "keep_intermediate"):
             if not isinstance(result[field], bool):
@@ -161,29 +133,62 @@ class Studio:
         self.lock = threading.RLock()
         self.cpu_lock = threading.Lock()
         self.assets, self.paths, self.jobs, self.clean_sources, self.started = {}, {}, {}, {}, {}
+        self.temporary_assets = {}
+        self.restore_clients = OrderedDict()
+        self.restore_pending = OrderedDict()
+        self.restore_running = self.restore_worker = None
+        self.closed = False
+        self.latest_source = self.latest_job = None
         self.active = None
-        self.pipe = self.pipe_path = self.pipe_key = self.embeds = self.module = None
+        self.pipe = self.pipe_path = self.pipe_key = self.pipe_scale = self.embeds = self.module = None
         self.device = "Detecting device…"
         self.runtime = {"ready": False, "refreshing": False, "devices": [{"id": "cpu", "name": "CPU", "type": "cpu",
                          "precisions": ["float32"], "offload_modes": ["none"]}], "default_device": "cpu"}
         self.runtime_probe_running = False
         self.models, self.lightning_adapters = model_inventory(ROOT)
         self.default_lightning = self.lightning_adapters[0]["path"] if self.lightning_adapters else None
-        self.default_steps = 32 if self.lightning_adapters and self.lightning_adapters[0]["steps"] == 8 else 8
+        self.default_steps = default_steps_for_lightning(self.default_lightning or "")
         self.default_source = self.default_result = None
         originals = sorted(p for p in ROOT.iterdir() if p.name.lower() == "original.png")
         if originals:
             self.default_source = self.register(originals[0], "source")["id"]
-        for path in sorted((ROOT / "out").glob("*desynth*.png"), key=lambda item: item.stat().st_mtime):
-            if path.name.lower().startswith("comparison_"):
-                continue
+        self.discover_results()
+        self.start_runtime_probe()
+
+    def discover_results(self):
+        """Read recorded outputs; legacy discovery accepts only matching images."""
+        if not self.default_source:
+            return
+        original = self.assets[self.default_source]
+        source_path = self.paths[self.default_source].resolve()
+        output_root = (ROOT / "out").resolve()
+        candidates = set()
+        for manifest in output_root.glob("*_desynth_*.json"):
             try:
-                asset = self.register(path, "result")
-                if path.name.lower().startswith("original_desynth"):
-                    self.default_result = asset["id"]
+                record = json.loads(manifest.read_text(encoding="utf-8"))
+                if Path(record["source"]["path"]).resolve() != source_path:
+                    continue
+                for output in record.get("outputs", []):
+                    path = Path(output["path"]).resolve()
+                    if output.get("kind") == "result" and path.is_relative_to(output_root) and path.is_file():
+                        candidates.add(path)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        for path in output_root.iterdir():
+            if (path.is_file() and path.name.casefold().startswith("original_desynth")
+                    and path.suffix.casefold() == ".png"
+                    and not re.search(r"(?:^|_)(?:diff|comparison|clean)(?:_|\.|$)", path.name, re.IGNORECASE)):
+                candidates.add(path.resolve())
+        valid = []
+        for path in candidates:
+            try:
+                with Image.open(path) as image:
+                    if image.size == (original["width"], original["height"]):
+                        valid.append((path.stat().st_mtime_ns, path))
             except (OSError, ValueError, Image.DecompressionBombError):
                 continue
-        self.start_runtime_probe()
+        for _, path in sorted(valid)[-MAX_JOBS:]:
+            self.default_result = self.register(path, "result")["id"]
 
     def start_runtime_probe(self):
         """Refresh capabilities without unloading the pipeline or changing a job."""
@@ -207,7 +212,7 @@ class Studio:
         with self.lock:
             self.models, self.lightning_adapters = models, adapters
             self.default_lightning = adapters[0]["path"] if adapters else None
-            self.default_steps = 32 if adapters and adapters[0]["steps"] == 8 else 8
+            self.default_steps = default_steps_for_lightning(self.default_lightning or "")
         self.start_runtime_probe()
         return self.state()
 
@@ -274,7 +279,7 @@ class Studio:
             raise APIError(f"{precision} precision is not supported on {capability['name']}. Choose {', '.join(capability['precisions'])}.")
         return {"device": device_id, "offload": offload, "precision": precision, "device_name": capability["name"]}
 
-    def register(self, path, kind, name=None):
+    def register(self, path, kind, name=None, *, temporary=False):
         with Image.open(path) as image:
             width, height = image.size
             if width * height > MAX_PIXELS:
@@ -284,25 +289,88 @@ class Studio:
                      url=f"/api/image/{asset_id}", kind=kind)
         with self.lock:
             self.assets[asset_id], self.paths[asset_id] = asset, path
+            if temporary:
+                self.temporary_assets[asset_id] = path.stat().st_size
+            self.prune_assets(keep={asset_id})
         return asset
 
     def asset(self, asset_id, kind=None):
-        if not isinstance(asset_id, str) or asset_id not in self.assets:
-            raise APIError("Image not found. Please upload it again.", 404)
-        asset = self.assets[asset_id]
-        if kind and asset["kind"] != kind:
-            raise APIError(f"Expected an image of type {kind}.")
-        return asset
+        with self.lock:
+            if not isinstance(asset_id, str) or asset_id not in self.assets:
+                raise APIError("Image not found. Please upload it again.", 404)
+            asset = self.assets[asset_id]
+            if kind and asset["kind"] != kind:
+                raise APIError(f"Expected an image of type {kind}.")
+            return asset
 
     def image(self, asset_id):
-        self.asset(asset_id)
-        with Image.open(self.paths[asset_id]) as image:
-            return ImageOps.exif_transpose(image).convert("RGBA")
+        with self.lock:
+            self.asset(asset_id)
+            with Image.open(self.paths[asset_id]) as image:
+                return ImageOps.exif_transpose(image).convert("RGBA")
 
-    def save(self, image, kind, name):
-        path = STORE / f"{secrets.token_hex(16)}.png"
+    def image_bytes(self, asset_id):
+        with self.lock:
+            self.asset(asset_id)
+            return self.paths[asset_id].read_bytes()
+
+    def save(self, image, kind, name, *, temporary=False):
+        directory = STORE / "temporary" if temporary else STORE
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{secrets.token_hex(16)}.png"
         image.save(path, format="PNG")
-        return self.register(path, kind, name)
+        try:
+            return self.register(path, kind, name, temporary=temporary)
+        except Exception:
+            # This is the exact file created above, never an imported output.
+            path.unlink(missing_ok=True)
+            raise
+
+    def forget_asset(self, asset_id):
+        """Evict metadata; only files explicitly owned as temporary are removed."""
+        path = self.paths.get(asset_id)
+        if asset_id in self.temporary_assets and path is not None:
+            if path.resolve().parent != (STORE / "temporary").resolve():
+                raise RuntimeError("Refusing to remove a temporary asset outside its directory.")
+            path.unlink(missing_ok=True)
+        self.temporary_assets.pop(asset_id, None)
+        self.assets.pop(asset_id, None)
+        self.paths.pop(asset_id, None)
+        self.clean_sources.pop(asset_id, None)
+
+    def prune_assets(self, keep=()):
+        with self.lock:
+            protected = set(keep) | {self.default_source, self.default_result, self.latest_source}
+            for job_id in (self.active, self.latest_job):
+                job = self.jobs.get(job_id, {})
+                protected.add(job.get("source_id"))
+                for role in ("clean", "result"):
+                    protected.add((job.get(role) or {}).get("id"))
+            for client in self.restore_clients.values():
+                protected.update(client.get("assets", ()))
+                protected.update(client.get("results", ()))
+            for ticket in [self.restore_running, *self.restore_pending.values()]:
+                if ticket:
+                    protected.update((ticket["source_id"], ticket["clean_id"]))
+            for asset_id in list(self.assets):
+                count_over = len(self.assets) > MAX_ASSETS
+                temp_over = (len(self.temporary_assets) > MAX_TEMP_ASSETS
+                             or sum(self.temporary_assets.values()) > MAX_TEMP_BYTES)
+                if asset_id not in protected and (count_over or temp_over and asset_id in self.temporary_assets):
+                    self.forget_asset(asset_id)
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            for ticket in self.restore_pending.values():
+                self.finish_restore(ticket, {"superseded": True})
+            self.restore_pending.clear()
+            worker = self.restore_worker
+        if worker:
+            worker.join(timeout=30)
+        with self.lock:
+            for asset_id in list(self.temporary_assets):
+                self.forget_asset(asset_id)
 
     def state(self):
         with self.lock:
@@ -341,50 +409,156 @@ class Studio:
         name = payload.get("name", "image.png")
         if not isinstance(name, str):
             raise APIError("name must be a string.")
-        return self.save(image, role, Path(name.replace("\\", "/")).name[:160] or "image.png")
+        asset = self.save(image, role, Path(name.replace("\\", "/")).name[:160] or "image.png", temporary=True)
+        with self.lock:
+            if role == "source":
+                self.latest_source = asset["id"]
+            self.prune_assets()
+        return asset
 
     def compare(self, source_id, result_id):
+        return self.compare_images(self.image(source_id), self.image(result_id))
+
+    @staticmethod
+    def compare_images(a, b):
         import numpy as np
-        a, b = self.image(source_id), self.image(result_id)
+        from compare import basic_metrics
         if a.size != b.size:
             raise APIError("Image dimensions differ. Comparison requires images of the same size.")
         aa, bb = np.asarray(a), np.asarray(b)
-        if min(a.size) >= 7:
-            from compare import metrics
-            result = metrics(np.ascontiguousarray(aa[..., :3]), np.ascontiguousarray(bb[..., :3]))
-        else:
-            delta = aa[..., :3].astype("float64") - bb[..., :3]
-            mse = float(np.square(delta).mean())
-            result = dict(mae=float(np.abs(delta).mean()), mse=mse, ssim=None,
-                          psnr_db=float(10 * np.log10(255**2 / mse)) if mse else None)
-        changed = np.any(aa != bb, axis=2)
-        result.update(changed_pct=float(changed.mean() * 100), identical=not bool(changed.any()),
-                      mean_alpha=float(np.abs(aa[..., 3].astype("float32") - bb[..., 3]).mean()))
+        result = basic_metrics(aa[..., :3], bb[..., :3])
+        changed, alpha = 0, 0.0
+        for row in range(0, a.height, 128):
+            left, right = aa[row:row + 128], bb[row:row + 128]
+            changed += int(np.count_nonzero(np.any(left != right, axis=2)))
+            alpha += float(np.abs(left[..., 3].astype("float32") - right[..., 3]).sum(dtype=np.float64))
+        pixels = a.width * a.height
+        result.update(changed_pct=changed / pixels * 100, identical=changed == 0, mean_alpha=alpha / pixels)
         return finite_json(result)
 
     def restore_image(self, clean, original, params):
-        if params["restore"]:
-            final = self.module._restore(clean, original, sigma=params["restore_sigma"],
-                                         mode=params["restore_mode"], unsharp_strength=params["unsharp"])
-        else:
-            final = clean.convert("RGB")
-        if final.size != original.size:
-            final = final.resize(original.size, Image.Resampling.LANCZOS)
-        final = final.convert("RGBA")
-        final.putalpha(original.getchannel("A"))
-        return final
+        return finish_image(clean, original, params, getattr(self.module, "_restore", None))
 
     def quick_restore(self, payload):
         source_id, clean_id = payload.get("source_id"), payload.get("clean_id")
-        self.asset(source_id, "source")
-        self.asset(clean_id, "clean")
-        if self.clean_sources.get(clean_id) != source_id:
-            raise APIError("This clean result belongs to a different source image.")
         params = parameters(payload.get("params", {}))
-        with self.cpu_lock:
-            image = self.restore_image(self.image(clean_id), self.image(source_id), params)
-            asset = self.save(image, "result", "desynth_restored.png")
-            return dict(result=asset, metrics=self.compare(source_id, asset["id"]))
+        with self.lock:
+            self.asset(source_id, "source")
+            self.asset(clean_id, "clean")
+            if self.clean_sources.get(clean_id) != source_id:
+                raise APIError("This clean result belongs to a different source image.")
+            client_id, client, revision = self.restore_client(payload)
+            if revision < client["revision"]:
+                return {"superseded": True}
+            for ticket in (self.restore_running, self.restore_pending.get(client_id)):
+                if ticket and ticket["client_id"] == client_id and ticket["revision"] == revision:
+                    return {"superseded": True}
+            self.supersede_restore(client_id, revision)
+            ticket = dict(client_id=client_id, revision=revision, source_id=source_id,
+                          clean_id=clean_id, params=params, event=threading.Event())
+            client["assets"] = (source_id, clean_id)
+            self.restore_pending[client_id] = ticket
+            if self.restore_worker is None:
+                self.restore_worker = threading.Thread(target=self.restore_work, daemon=True)
+                self.restore_worker.start()
+        # Replaced pending requests wake immediately, so handlers do not build
+        # an unbounded queue while the CPU is processing a previous image.
+        if not ticket["event"].wait(60):
+            with self.lock:
+                ticket["cancelled"] = True
+                if self.restore_pending.get(client_id) is ticket:
+                    self.restore_pending.pop(client_id)
+            raise APIError("Restoration timed out. Please try again.", 503)
+        if "error" in ticket:
+            raise ticket["error"]
+        return ticket["response"]
+
+    def restore_client(self, payload):
+        if self.closed:
+            raise APIError("The server is stopping.", 503)
+        client_id = payload.get("client_id", "legacy")
+        if not isinstance(client_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", client_id):
+            raise APIError("client_id must contain 1–80 letters, digits, hyphens or underscores.")
+        client = self.restore_clients.get(client_id)
+        revision = payload.get("revision", (client or {}).get("revision", 0) + 1)
+        revision = number(revision, "revision", 0, 2**53 - 1, True)
+        if client is None:
+            if len(self.restore_clients) >= MAX_RESTORE_CLIENTS:
+                evict = next((key for key in self.restore_clients if key not in self.restore_pending
+                              and (not self.restore_running or self.restore_running["client_id"] != key)), None)
+                if evict is None:
+                    raise APIError("Too many simultaneous preview sessions. Retry shortly.", 429)
+                self.restore_clients.pop(evict)
+            client = {"revision": -1, "assets": (), "results": []}
+            self.restore_clients[client_id] = client
+        self.restore_clients.move_to_end(client_id)
+        return client_id, client, revision
+
+    def supersede_restore(self, client_id, revision):
+        client = self.restore_clients[client_id]
+        if revision < client["revision"]:
+            return
+        client["revision"] = revision
+        pending = self.restore_pending.get(client_id)
+        if pending and pending["revision"] < revision:
+            self.restore_pending.pop(client_id)
+            self.finish_restore(pending, {"superseded": True})
+
+    def cancel_restore(self, payload):
+        with self.lock:
+            client_id, client, revision = self.restore_client(payload)
+            self.supersede_restore(client_id, revision)
+            self.prune_assets()
+            return {"superseded": True}
+
+    def restore_obsolete(self, ticket):
+        with self.lock:
+            client = self.restore_clients.get(ticket["client_id"])
+            return (self.closed or ticket.get("cancelled", False) or client is None
+                    or client["revision"] != ticket["revision"])
+
+    @staticmethod
+    def finish_restore(ticket, response=None, error=None):
+        if error is not None:
+            ticket["error"] = error
+        else:
+            ticket["response"] = response
+        ticket["event"].set()
+
+    def restore_work(self):
+        while True:
+            with self.lock:
+                if not self.restore_pending or self.closed:
+                    self.restore_worker = None
+                    self.restore_running = None
+                    return
+                _, ticket = self.restore_pending.popitem(last=False)
+                self.restore_running = ticket
+            try:
+                response = {"superseded": True}
+                with self.cpu_lock:
+                    if not self.restore_obsolete(ticket):
+                        original, clean = self.image(ticket["source_id"]), self.image(ticket["clean_id"])
+                        if not self.restore_obsolete(ticket):
+                            image = self.restore_image(clean, original, ticket["params"])
+                            if not self.restore_obsolete(ticket):
+                                metrics = self.compare_images(original, image)
+                                if not self.restore_obsolete(ticket):
+                                    asset = self.save(image, "result", "desynth_restored.png", temporary=True)
+                                    with self.lock:
+                                        if self.restore_obsolete(ticket):
+                                            self.forget_asset(asset["id"])
+                                        else:
+                                            client = self.restore_clients[ticket["client_id"]]
+                                            client["results"] = [*client["results"][-1:], asset["id"]]
+                                            self.prune_assets()
+                                            response = dict(result=asset, metrics=metrics, revision=ticket["revision"])
+                self.finish_restore(ticket, response)
+            except Exception as exc:
+                self.finish_restore(ticket, error=exc)
+            finally:
+                with self.lock:
+                    self.restore_running = None
 
     def process(self, payload):
         source_id = payload.get("source_id")
@@ -394,7 +568,7 @@ class Studio:
                 raise APIError("Processing is already running. Wait for the current job to finish.", 409)
             raw_params = payload.get("params", {})
             preferred = next((item for item in self.lightning_adapters if isinstance(raw_params, dict) and item["path"] == raw_params.get("lightning")), None)
-            default_steps = (32 if preferred["steps"] == 8 else 8) if preferred else self.default_steps
+            default_steps = default_steps_for_lightning(preferred["path"]) if preferred else self.default_steps
             params = parameters(raw_params, process=True, default_steps=default_steps)
             runtime = self.resolve_runtime(params)
             requested = params["transformer"]
@@ -424,11 +598,17 @@ class Studio:
             self.jobs[job_id] = job
             self.started[job_id] = time.monotonic()
             self.active = job_id
+            while len(self.jobs) > MAX_JOBS:
+                oldest = next(key for key in self.jobs if key not in (self.active, self.latest_job))
+                self.jobs.pop(oldest)
+                self.started.pop(oldest, None)
+            self.prune_assets()
         threading.Thread(target=self.work, args=(job_id, source_id, params), daemon=True).start()
         return dict(job)
 
     def work(self, job_id, source_id, params):
         job, started = self.jobs[job_id], self.started[job_id]
+        failed = False
 
         def update(**values):
             with self.lock:
@@ -443,13 +623,7 @@ class Studio:
             runtime = job["runtime"]
             dtype = getattr(ds.torch, runtime["precision"])
             original = self.image(source_id)
-            image = original.convert("RGB")
-            if params["preview"] and max(image.size) > 768:
-                ratio = 768 / max(image.size)
-                image = image.resize(tuple(max(16, int(size * ratio) // 16 * 16) for size in image.size), Image.Resampling.LANCZOS)
-            work_size = tuple(max(16, size // 16 * 16) for size in image.size)
-            if image.size != work_size:
-                image = image.resize(work_size, Image.Resampling.LANCZOS)
+            image = prepare_image(original, params["preview"])
             update(preview_size=list(image.size), stage="Loading embeddings", progress=5)
             if self.embeds is None:
                 self.embeds = ds.torch.load(embeddings_path(ROOT), map_location="cpu", weights_only=False)
@@ -464,7 +638,7 @@ class Studio:
             for candidate in candidates:
                 try:
                     pipe_key = (weight_identity(ROOT / candidate), weight_identity(ROOT / params["lightning"]),
-                                params["lightning_scale"], runtime["device"], runtime["offload"], runtime["precision"])
+                                runtime["device"], runtime["offload"], runtime["precision"])
                     if self.pipe_key != pipe_key or self.pipe is None:
                         self.drop_pipeline()
                         update(stage=f"Loading {candidate} (first run takes longer)", progress=7)
@@ -473,6 +647,10 @@ class Studio:
                                                       lightning_lora=ROOT / params["lightning"], lightning_scale=params["lightning_scale"])
                         self.pipe_path = candidate
                         self.pipe_key = pipe_key
+                        self.pipe_scale = params["lightning_scale"]
+                    elif self.pipe_scale != params["lightning_scale"]:
+                        self.pipe.set_adapters(["lightning"], adapter_weights=[params["lightning_scale"]])
+                        self.pipe_scale = params["lightning_scale"]
                     current = image
                     for pass_index in range(params["passes"]):
                         def step_end(pipe, step, timestep, callback_kwargs):
@@ -489,41 +667,49 @@ class Studio:
                     clean = current
                     break
                 except Exception as exc:
-                    self.drop_pipeline()
                     if ds._is_oom(exc) and candidate != candidates[-1]:
                         update(stage="Out of memory: trying a smaller model", progress=7)
-                        continue
-                    raise
+                    else:
+                        raise
+                # The failed call's traceback can own tensors even after
+                # self.pipe is cleared. Leave its exception scope first.
+                self.drop_pipeline(force=True)
             update(stage="Restoring details", progress=90)
-            clean_asset = self.save(clean.convert("RGBA"), "clean", "desynth_clean.png")
-            self.clean_sources[clean_asset["id"]] = source_id
-            final = self.restore_image(clean, original, params)
-            result = self.save(final, "result", f"{Path(self.assets[source_id]['name']).stem}_desynth_seed{params['seed']}.png")
-            update(stage="Comparing RGBA channels", progress=95, clean=clean_asset, result=result)
+            clean_asset = self.save(clean.convert("RGBA"), "clean", "desynth_clean.png",
+                                    temporary=not params["keep_intermediate"])
+            with self.lock:
+                self.clean_sources[clean_asset["id"]] = source_id
+                update(clean=clean_asset)
             with self.cpu_lock:
-                metrics = self.compare(source_id, result["id"])
+                final = self.restore_image(clean, original, params)
+                update(stage="Comparing RGBA channels", progress=95)
+                metrics = self.compare_images(original, final)
+            result = self.save(final, "result", f"{Path(self.assets[source_id]['name']).stem}_desynth_seed{params['seed']}.png")
+            update(result=result)
             update(status="done", stage="Done", progress=100, metrics=metrics)
+            with self.lock:
+                self.latest_job = job_id
         except Exception as exc:
+            failed = True
             traceback.print_exc()
             message = str(exc) or type(exc).__name__
             if self.module and self.module._is_oom(exc):
-                self.drop_pipeline()
                 message = "Out of memory. Use a smaller image, choose sequential offload on CUDA, or select a Q2 GGUF model. " + message
             update(status="error", stage="Processing failed", error=message[:1800])
         finally:
-            with self.lock:
-                self.active = None
+            try:
+                if failed:
+                    self.drop_pipeline(force=True)
+            finally:
+                with self.lock:
+                    self.active = None
+                    self.prune_assets()
 
-    def drop_pipeline(self):
-        if self.pipe is not None:
-            old, self.pipe, self.pipe_path, self.pipe_key = self.pipe, None, None, None
-            self.module._free_pipeline(old)
-            del old
-            gc.collect()
-            if self.module.torch.cuda.is_available():
-                for index in range(self.module.torch.cuda.device_count()):
-                    with self.module.torch.cuda.device(index):
-                        self.module.torch.cuda.empty_cache()
+    def drop_pipeline(self, *, force=False):
+        if self.pipe is not None or force:
+            self.pipe, self.pipe_path, self.pipe_key, self.pipe_scale = None, None, None, None
+            if self.module is not None:
+                self.module._free_pipeline()
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -598,8 +784,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.studio.state())
             if path.startswith("/api/image/"):
                 asset_id = path.removeprefix("/api/image/")
-                self.studio.asset(asset_id)
-                return self.send_bytes(200, self.studio.paths[asset_id].read_bytes(), "image/png")
+                return self.send_bytes(200, self.studio.image_bytes(asset_id), "image/png")
             if path.startswith("/api/pixels/"):
                 asset_id = path.removeprefix("/api/pixels/")
                 return self.send_bytes(200, self.studio.image(asset_id).tobytes(), "application/octet-stream")
@@ -613,6 +798,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, dict(job))
             files = {"/": ("index.html", "text/html; charset=utf-8"), "/index.html": ("index.html", "text/html; charset=utf-8"),
                      "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                     "/diff-worker.js": ("diff-worker.js", "text/javascript; charset=utf-8"),
                      "/style.css": ("style.css", "text/css; charset=utf-8"), "/styles.css": ("style.css", "text/css; charset=utf-8")}
             if path not in files:
                 raise APIError("Not found.", 404)
@@ -663,6 +849,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(202, self.studio.process(payload))
             if path == "/api/restore":
                 return self.send_json(200, self.studio.quick_restore(payload))
+            if path == "/api/restore/cancel":
+                return self.send_json(200, self.studio.cancel_restore(payload))
             if path == "/api/compare":
                 with self.studio.cpu_lock:
                     return self.send_json(200, self.studio.compare(payload.get("source_id"), payload.get("result_id")))
@@ -732,6 +920,7 @@ def main():
         print("\nDeSynth Studio stopped.")
     finally:
         server.server_close()
+        studio.close()
 
 
 if __name__ == "__main__":
