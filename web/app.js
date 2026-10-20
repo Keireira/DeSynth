@@ -2,12 +2,12 @@
 
 const $ = (id) => document.getElementById(id);
 const viewModes = ["original", "split", "side", "result", "diff"];
-const defaults = { denoise: 0.25, steps: 8, passes: 1, seed: "", sigma: 1.95, unsharp: 0, restoreMode: "gaussian", restore: true, keepIntermediate: false, transformer: "" };
+const defaults = { denoise: 0.25, steps: 32, passes: 1, seed: "", sigma: 1.95, unsharp: 0, restoreMode: "gaussian", restore: true, keepIntermediate: false, transformer: "", lightning: "" };
 const state = {
   source: null, result: null, clean: null, sourceImage: null, resultImage: null,
   mode: "split", split: 0.5, zoom: 1, panX: 0, panY: 0, rect: null,
   busy: false, restoring: false, generation: 0, restoreVersion: 0,
-  runtime: null, runtimeChoice: { device: "auto", offload: "auto", precision: "auto" }, runningRuntime: null,
+  runtime: null, environmentReady: false, inventoryReady: false, runtimeChoice: { device: "auto", offload: "auto", precision: "auto" }, runningRuntime: null,
   pair: null, pairLoading: null, pairVersion: 0, diffCanvas: null, diffKey: "", metricsVersion: 0, resultVersion: 0, uploadVersion: 0,
   space: false, drag: null, dirty: false,
 };
@@ -91,7 +91,7 @@ function refreshProcessingFeedback() {
 function updateCards() {
   refreshProcessingFeedback();
   $("empty-state").hidden = Boolean(state.sourceImage);
-  $("process-button").disabled = state.busy || !state.source || !state.runtime?.ready;
+  $("process-button").disabled = state.busy || !state.source || !state.runtime?.ready || !state.environmentReady;
   $("upload-button").disabled = state.busy;
   $("settings-button").disabled = state.busy;
   $("export-button").disabled = state.restoring || !(state.mode === "original" ? state.source : state.result);
@@ -390,6 +390,7 @@ function settings() {
     restore_sigma: Number($("sigma").value), restore_mode: $("restore-mode").value,
     unsharp: Number($("unsharp").value), restore: $("restore").checked,
     keep_intermediate: $("keep-intermediate").checked, transformer: $("transformer").value || null,
+    lightning: $("lightning").value || null,
     ...state.runtimeChoice,
   };
 }
@@ -470,11 +471,13 @@ function refreshControlValues() {
   setText("diff-gain-value", `×${$("diff-gain").value}`);
   $("restore-settings").classList.toggle("disabled", !$("restore").checked);
   for (const id of ["sigma", "restore-mode", "unsharp"]) $(id).disabled = state.busy || !$("restore").checked;
-  try { localStorage.setItem("desynth.settings.v1", JSON.stringify(settings())); } catch { /* Preferences are optional. */ }
+  if (state.inventoryReady) {
+    try { localStorage.setItem("desynth.settings.v1", JSON.stringify(settings())); } catch { /* Preferences are optional. */ }
+  }
 }
 
 function applySettings(value) {
-  const pairs = { denoise: value.denoise ?? defaults.denoise, steps: value.steps ?? defaults.steps, passes: value.passes ?? defaults.passes, seed: value.seed ?? "", sigma: value.restore_sigma ?? defaults.sigma, unsharp: value.unsharp ?? defaults.unsharp, "restore-mode": value.restore_mode ?? defaults.restoreMode, transformer: value.transformer ?? "" };
+  const pairs = { denoise: value.denoise ?? defaults.denoise, steps: value.steps ?? defaults.steps, passes: value.passes ?? defaults.passes, seed: value.seed ?? "", sigma: value.restore_sigma ?? defaults.sigma, unsharp: value.unsharp ?? defaults.unsharp, "restore-mode": value.restore_mode ?? defaults.restoreMode, transformer: value.transformer ?? "", lightning: value.lightning ?? "" };
   for (const [id, item] of Object.entries(pairs)) $(id).value = item;
   $("restore").checked = value.restore ?? true;
   $("keep-intermediate").checked = value.keep_intermediate ?? false;
@@ -510,6 +513,7 @@ function busy(value) {
   setText("process-label", value ? "Processing…" : "Process image");
   $("settings-form").querySelectorAll("input, select, button").forEach((input) => { input.disabled = value; });
   $("transformer").disabled = value;
+  $("lightning").disabled = value;
   $("reset-button").disabled = value;
   if (!value) state.runningRuntime = null;
   refreshRuntimeControls();
@@ -518,7 +522,7 @@ function busy(value) {
 }
 
 async function processImage() {
-  if (state.busy || !state.source || !state.runtime?.ready) return;
+  if (state.busy || !state.source || !state.runtime?.ready || !state.environmentReady) return;
   try {
     const params = settings();
     clearTimeout(restoreTimer);
@@ -615,7 +619,7 @@ function bindEvents() {
     refreshControlValues();
     state.dirty = true;
   });
-  for (const id of ["denoise", "steps", "passes", "seed", "transformer", "keep-intermediate"]) $(id).addEventListener("input", () => {
+  for (const id of ["denoise", "steps", "passes", "seed", "transformer", "lightning", "keep-intermediate"]) $(id).addEventListener("input", () => {
     refreshControlValues(); state.dirty = true;
   });
   for (const id of ["sigma", "unsharp", "restore-mode", "restore"]) $(id).addEventListener("input", () => { refreshControlValues(); scheduleRestore(); });
@@ -660,12 +664,31 @@ async function initialize() {
   updateCards();
   try {
     const session = await connectToServer();
+    state.environmentReady = Boolean(session.ready);
+    defaults.steps = session.default_steps || 8;
+    for (const [id, inventory, preferred] of [["transformer", session.models, session.models?.[0]?.path], ["lightning", session.lightning_adapters, session.default_lightning]]) {
+      const select = $(id);
+      const automatic = select.options[0];
+      const defaultItem = inventory?.find((item) => item.path === preferred);
+      automatic.textContent = defaultItem ? `Automatic (${defaultItem.label || defaultItem.name})` : "No weights found";
+      for (const item of inventory || []) {
+        const option = document.createElement("option");
+        option.value = item.path;
+        option.textContent = item.label || item.name;
+        option.title = item.path;
+        select.appendChild(option);
+      }
+      if (saved[id]) {
+        const normalized = String(saved[id]).replaceAll("\\", "/");
+        const match = inventory?.find((item) => item.path === normalized) || inventory?.find((item) => item.name === normalized.split("/").pop());
+        saved[id] = match?.path || "";
+        if (!match) toast(`The saved ${id === "lightning" ? "Lightning adapter" : "model"} is unavailable. Using Automatic.`);
+      }
+    }
+    state.inventoryReady = true;
+    applySettings(saved);
     updateRuntimeInventory(session.runtime);
     if (!session.runtime?.ready) detectRuntime();
-    for (const model of session.models || []) {
-      const option = document.createElement("option"); option.value = model.path; option.textContent = model.name; $("transformer").appendChild(option);
-    }
-    if (saved.transformer) $("transformer").value = saved.transformer;
     setText("model-label", session.models?.[0]?.name || "No models found");
     const activeJob = session.active_job_id ? await api(`/api/job/${session.active_job_id}`) : null;
     const source = session.assets?.find((asset) => asset.id === (activeJob?.source_id || selection.source)) || session.assets?.find((asset) => asset.id === session.default_source_id);
