@@ -16,7 +16,7 @@ VENV_PYTHON = $(VENV)/bin/python
 endif
 
 INPUT ?= original.png
-OUTPUT ?= out/original_desynth_s32_d0.250_p1_r1.95.png
+OUTPUT ?=
 ARGS ?=
 VISUAL_OUT ?= out/comparison.png
 DIFF_OUT ?= out/diff.png

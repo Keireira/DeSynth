@@ -9,62 +9,71 @@ from pathlib import Path
 import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
+from processing import load_rgba
 
 ROOT = Path(__file__).parent
 
 
 def load(path: Path) -> np.ndarray:
-    img = cv2.imread(str(path))
-    if img is None:
-        raise SystemExit(f"can't read {path}")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    try:
+        return np.array(load_rgba(path).convert("RGB"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"can't read {path}: {exc}") from exc
+
+
+def _ssim_rgb(a: np.ndarray, b: np.ndarray):
+    if min(a.shape[:2]) < 7:
+        return None
+    # skimage's default SSIM uses a 7x7 window and excludes three border pixels.
+    # Three-row halos make each strip equivalent to the corresponding region
+    # of the full image; only scratch memory is reduced, never the resolution.
+    total, rows = 0.0, a.shape[0] - 6
+    for start in range(3, a.shape[0] - 3, 128):
+        stop = min(start + 128, a.shape[0] - 3)
+        for channel in range(3):
+            aa = a[start - 3:stop + 3, :, channel].astype(np.float32)
+            bb = b[start - 3:stop + 3, :, channel].astype(np.float32)
+            total += float(ssim(aa, bb, data_range=255)) * (stop - start)
+    return total / (rows * 3)
+
+
+def basic_metrics(a: np.ndarray, b: np.ndarray) -> dict:
+    """Exact pixel metrics and SSIM for UI previews, with bounded scratch space."""
+    if a.shape != b.shape or a.ndim != 3 or a.shape[2] != 3:
+        raise ValueError("Metrics require RGB images with matching dimensions.")
+    squared, absolute = 0.0, 0.0
+    for row in range(0, a.shape[0], 128):
+        delta = a[row:row + 128].astype(np.float32) - b[row:row + 128]
+        absolute += float(np.abs(delta).sum(dtype=np.float64))
+        squared += float(np.square(delta).sum(dtype=np.float64))
+    mse = squared / a.size
+    return dict(shape=a.shape, mse=mse, mae=absolute / a.size,
+                psnr_db=float(10 * np.log10(255**2 / mse)) if mse else float("inf"),
+                ssim=_ssim_rgb(a, b))
 
 
 def metrics(a: np.ndarray, b: np.ndarray) -> dict:
-    af = a.astype(np.float64)
-    bf = b.astype(np.float64)
-    diff = af - bf
-
-    mse = float((diff ** 2).mean())
-    mae = float(np.abs(diff).mean())
-    psnr = float(10 * np.log10((255.0 ** 2) / mse)) if mse > 0 else float("inf")
-
-    # Structural similarity, computed per channel + averaged.
-    ssim_score, _ = ssim(a, b, channel_axis=2, full=True, data_range=255)
-
-    # Histogram correlation per channel (Pearson).
-    hist_corr = []
-    for c in range(3):
-        ha = cv2.calcHist([a], [c], None, [256], [0, 256]).flatten()
-        hb = cv2.calcHist([b], [c], None, [256], [0, 256]).flatten()
+    """Extended, full-resolution analysis used by the comparison CLI."""
+    result = basic_metrics(a, b)
+    hist_corr, low_scores, high_scores = [], [], []
+    for channel in range(3):
+        aa, bb = a[..., channel].copy(), b[..., channel].copy()
+        ha = cv2.calcHist([aa], [0], None, [256], [0, 256]).flatten()
+        hb = cv2.calcHist([bb], [0], None, [256], [0, 256]).flatten()
         hist_corr.append(float(cv2.compareHist(ha, hb, cv2.HISTCMP_CORREL)))
-
-    # Frequency-band agreement: split at sigma=1.95 (the pipeline cutoff) and
-    # measure SSIM in each band separately. Tells us where similarity lives.
-    sigma = 1.95
-    low_a = cv2.GaussianBlur(af.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
-    low_b = cv2.GaussianBlur(bf.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
-    high_a = af.astype(np.float32) - low_a
-    high_b = bf.astype(np.float32) - low_b
-    ssim_low = float(ssim(low_a.clip(0, 255).astype(np.uint8),
-                          low_b.clip(0, 255).astype(np.uint8),
-                          channel_axis=2, data_range=255))
-    # High-pass is centered around 0 with small range — shift to [0,255] for SSIM.
-    ha = (high_a + 128).clip(0, 255).astype(np.uint8)
-    hb = (high_b + 128).clip(0, 255).astype(np.uint8)
-    ssim_high = float(ssim(ha, hb, channel_axis=2, data_range=255))
-
-    return {
-        "shape": a.shape,
-        "mse": mse,
-        "mae": mae,
-        "psnr_db": psnr,
-        "ssim": float(ssim_score),
-        "ssim_low_pass": ssim_low,
-        "ssim_high_pass": ssim_high,
-        "hist_corr_rgb": hist_corr,
-        "mean_hist_corr": float(np.mean(hist_corr)),
-    }
+        af, bf = aa.astype(np.float32), bb.astype(np.float32)
+        low_a = cv2.GaussianBlur(af, (0, 0), sigmaX=1.95, sigmaY=1.95)
+        low_b = cv2.GaussianBlur(bf, (0, 0), sigmaX=1.95, sigmaY=1.95)
+        if min(aa.shape) >= 7:
+            low_scores.append(ssim(low_a.clip(0, 255).astype(np.uint8).astype(np.float32),
+                                   low_b.clip(0, 255).astype(np.uint8).astype(np.float32), data_range=255))
+            high_a = (af - low_a + 128).clip(0, 255).astype(np.uint8).astype(np.float32)
+            high_b = (bf - low_b + 128).clip(0, 255).astype(np.uint8).astype(np.float32)
+            high_scores.append(ssim(high_a, high_b, data_range=255))
+    result.update(ssim_low_pass=float(np.mean(low_scores)) if low_scores else None,
+                  ssim_high_pass=float(np.mean(high_scores)) if high_scores else None,
+                  hist_corr_rgb=hist_corr, mean_hist_corr=float(np.mean(hist_corr)))
+    return result
 
 
 def _draw_visual(a: np.ndarray, b: np.ndarray, m: dict, out_path: Path) -> None:

@@ -6,11 +6,12 @@ const defaults = { denoise: 0.25, steps: 32, passes: 1, seed: "", sigma: 1.95, u
 const state = {
   source: null, result: null, clean: null, sourceImage: null, resultImage: null,
   mode: "split", split: 0.5, zoom: 1, panX: 0, panY: 0, rect: null,
-  busy: false, restoring: false, generation: 0, restoreVersion: 0,
+  busy: false, uploading: false, exporting: false, restoring: false, generation: 0, restoreVersion: 0,
   runtime: null, environmentReady: false, inventoryReady: false, runtimeChoice: { device: "auto", offload: "auto", precision: "auto" }, runningRuntime: null,
   modelChoice: { transformer: null, lightning: null }, models: [], lightningAdapters: [], defaultLightning: null,
   settingsDraft: null, presets: [], refreshing: false,
-  pair: null, pairLoading: null, pairVersion: 0, diffCanvas: null, diffKey: "", metricsVersion: 0, resultVersion: 0, uploadVersion: 0,
+  pairVersion: 0, diffVersion: 0, diffCanvas: null, diffKey: "", diffPromise: null, diffPendingKey: "", diffFailedKey: "",
+  metricsVersion: 0, resultVersion: 0, uploadVersion: 0,
   space: false, drag: null, dirty: false,
 };
 let toastTimer;
@@ -18,6 +19,10 @@ let restoreTimer;
 let restoreController;
 let drawFrame;
 let transparencyTile;
+const restoreClientId = crypto.randomUUID();
+let diffWorker;
+let diffRequestId = 0;
+const diffRequests = new Map();
 
 function toast(message, error = false) {
   const element = $("toast");
@@ -55,16 +60,29 @@ function dimensions(asset) { return asset ? `${asset.width.toLocaleString("en-US
 
 function invalidateDiff() {
   state.pairVersion++;
-  state.pair = null;
-  state.pairLoading = null;
   state.diffCanvas = null;
   state.diffKey = "";
+  state.diffPromise = null;
+  state.diffPendingKey = "";
+  state.diffFailedKey = "";
+  for (const request of diffRequests.values()) request.resolve(null);
+  diffRequests.clear();
+  diffWorker?.postMessage({ type: "invalidate", retain: [state.source?.id, state.result?.id].filter(Boolean) });
+}
+
+function supersedeRestore() {
+  const revision = ++state.restoreVersion;
+  restoreController?.abort();
+  // Abort alone does not cancel server work. Publish the revision immediately,
+  // including during the debounce interval or when opening a different image.
+  api("/api/restore/cancel", { client_id: restoreClientId, revision }).catch(() => {});
+  return revision;
 }
 
 function cancelRestore() {
   clearTimeout(restoreTimer);
-  state.restoreVersion++;
-  restoreController?.abort();
+  supersedeRestore();
+  state.resultVersion++;
   state.restoring = false;
 }
 
@@ -94,11 +112,11 @@ function updateCards() {
   refreshProcessingFeedback();
   $("empty-state").hidden = Boolean(state.sourceImage);
   const problem = configurationProblem({ ...state.modelChoice, ...state.runtimeChoice });
-  $("process-button").disabled = state.busy || state.refreshing || !state.source || !state.runtime?.ready || !state.environmentReady || Boolean(problem);
+  $("process-button").disabled = state.busy || state.uploading || state.refreshing || !state.source || !state.runtime?.ready || !state.environmentReady || Boolean(problem);
   $("process-button").title = problem || "Process image";
-  $("upload-button").disabled = state.busy;
+  $("upload-button").disabled = state.busy || state.uploading;
   $("settings-button").disabled = state.busy;
-  $("export-button").disabled = state.restoring || !(state.mode === "original" ? state.source : state.result);
+  $("export-button").disabled = state.restoring || state.uploading || state.exporting || !(state.mode === "original" ? state.source : state.result);
   document.querySelectorAll(".mode-tabs [data-mode]").forEach((button) => {
     button.disabled = button.dataset.mode !== "original" && !state.result;
   });
@@ -124,13 +142,13 @@ async function updateMetrics() {
   } catch (error) { if (version === state.metricsVersion) { setMetrics(null); toast(error.message, true); } }
 }
 
-async function useSource(asset) {
+async function useSource(asset, uploadVersion = null) {
   cancelRestore();
   state.metricsVersion++;
   state.resultVersion++;
   const generation = ++state.generation;
   const image = await loadImage(asset);
-  if (generation !== state.generation) return;
+  if (generation !== state.generation || (uploadVersion !== null && uploadVersion !== state.uploadVersion)) return false;
   state.source = asset;
   state.sourceImage = image;
   state.result = state.clean = state.resultImage = null;
@@ -140,9 +158,10 @@ async function useSource(asset) {
   setMode("original");
   resetView();
   updateCards();
+  return true;
 }
 
-async function useResult(asset, metrics, clean = null) {
+async function useResult(asset, metrics, clean = null, isCurrent = () => true) {
   if (!state.source) throw new Error("Open an original image first.");
   if (asset.width !== state.source.width || asset.height !== state.source.height) {
     throw new Error(`Result size (${dimensions(asset)}) does not match the original (${dimensions(state.source)}).`);
@@ -150,7 +169,7 @@ async function useResult(asset, metrics, clean = null) {
   const generation = state.generation;
   const version = ++state.resultVersion;
   const image = await loadImage(asset);
-  if (generation !== state.generation || version !== state.resultVersion) return false;
+  if (generation !== state.generation || version !== state.resultVersion || !isCurrent()) return false;
   state.result = asset;
   state.resultImage = image;
   if (clean !== undefined) state.clean = clean;
@@ -168,9 +187,12 @@ async function upload(file, role = "source") {
   if (role === "result" && !state.source) { toast("Open an original image first.", true); return; }
   if (file.size > 32 * 1024 * 1024) { toast("Maximum file size: 32 MB.", true); return; }
   const uploadVersion = ++state.uploadVersion;
+  state.uploading = true;
+  state.generation++;
   cancelRestore();
   state.metricsVersion++;
   state.resultVersion++;
+  updateCards();
   try {
     setText("live-status", "Opening image…");
     const data = await new Promise((resolve, reject) => {
@@ -179,15 +201,22 @@ async function upload(file, role = "source") {
       reader.onerror = () => reject(new Error("Could not read the file."));
       reader.readAsDataURL(file);
     });
+    if (uploadVersion !== state.uploadVersion) return;
     const asset = await api("/api/upload", { name: file.name, data, role });
     if (uploadVersion !== state.uploadVersion) return;
-    if (role === "source") await useSource(asset);
+    if (role === "source") {
+      if (!await useSource(asset, uploadVersion)) return;
+    }
     else {
-      await useResult(asset, null, null);
+      if (!await useResult(asset, null, null, () => uploadVersion === state.uploadVersion)) return;
       setMode("split");
     }
     toast(role === "source" ? "Image loaded" : "Result imported");
-  } catch (error) { toast(error.message, true); setText("live-status", "Could not open the image."); }
+  } catch (error) {
+    if (uploadVersion === state.uploadVersion) { toast(error.message, true); setText("live-status", "Could not open the image."); }
+  } finally {
+    if (uploadVersion === state.uploadVersion) { state.uploading = false; updateCards(); }
+  }
 }
 
 function setMode(mode) {
@@ -213,52 +242,84 @@ function imageRect(image, area) {
   return { x: area.x + (area.width - width) / 2 + state.panX, y: area.y + (area.height - height) / 2 + state.panY, width, height, scale };
 }
 
-async function exactPixels(asset) {
-  const response = await fetch(`/api/pixels/${encodeURIComponent(asset.id)}`);
-  if (!response.ok) throw new Error("Could not read RGBA pixel data.");
-  const pixels = new Uint8Array(await response.arrayBuffer());
-  if (pixels.length !== asset.width * asset.height * 4) throw new Error("Incomplete RGBA pixel data.");
-  return pixels;
+function diffOptions() {
+  if (!state.source || !state.result) return null;
+  const gain = Math.max(0, Math.min(255, Number($("diff-gain").value) || 0));
+  const channel = $("diff-channel").value;
+  const key = `${state.source.id}:${state.result.id}:${gain}:${channel}`;
+  return { key, gain, channel, source: state.source, result: state.result };
 }
 
-function prepareDiffPixels() {
-  if (state.pair) return Promise.resolve();
-  if (state.pairLoading) return state.pairLoading;
-  if (!state.source || !state.result) return Promise.resolve();
+function requestDiff(options) {
+  if (!diffWorker) {
+    diffWorker = new Worker("/diff-worker.js");
+    diffWorker.onmessage = ({ data }) => {
+      const request = diffRequests.get(data.id);
+      if (!request) return;
+      diffRequests.delete(data.id);
+      if (data.error) request.reject(new Error(data.error));
+      else request.resolve(data.cancelled ? null : data);
+    };
+    diffWorker.onerror = () => {
+      for (const request of diffRequests.values()) request.reject(new Error("Could not calculate the diff. Reload the page and try again."));
+      diffRequests.clear();
+      diffWorker.terminate();
+      diffWorker = null;
+    };
+  }
+  const id = ++diffRequestId;
+  // One active request and the newest pending request are enough. Resolve
+  // replaced callers now; the worker also stops obsolete work between chunks.
+  for (const request of diffRequests.values()) request.resolve(null);
+  diffRequests.clear();
+  return new Promise((resolve, reject) => {
+    diffRequests.set(id, { resolve, reject });
+    diffWorker.postMessage({ type: "diff", id, ...options });
+  });
+}
+
+async function ensureDiff(options = diffOptions()) {
+  if (!options) return null;
+  if (state.diffKey === options.key) return state.diffCanvas;
+  if (state.diffPendingKey === options.key) return state.diffPromise;
   const version = state.pairVersion;
-  state.pairLoading = Promise.all([exactPixels(state.source), exactPixels(state.result)])
-    .then(([a, b]) => { if (version === state.pairVersion) { state.pair = { a, b }; requestDraw(); } })
-    .catch((error) => { if (version === state.pairVersion) toast(error.message, true); })
-    .finally(() => { if (version === state.pairVersion) state.pairLoading = null; });
-  return state.pairLoading;
+  const requestVersion = ++state.diffVersion;
+  state.diffPendingKey = options.key;
+  state.diffPromise = (async () => {
+    try {
+      const result = await requestDiff(options);
+      if (!result || version !== state.pairVersion || requestVersion !== state.diffVersion || options.key !== diffOptions()?.key) return null;
+      const canvas = document.createElement("canvas");
+      canvas.width = result.width;
+      canvas.height = result.height;
+      canvas.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(result.buffer), result.width, result.height), 0, 0);
+      state.diffCanvas = canvas;
+      state.diffKey = options.key;
+      state.diffFailedKey = "";
+      requestDraw();
+      return canvas;
+    } catch (error) {
+      if (version === state.pairVersion && requestVersion === state.diffVersion && options.key === diffOptions()?.key) {
+        state.diffFailedKey = options.key;
+        toast(error.message, true);
+      }
+      return null;
+    } finally {
+      if (version === state.pairVersion && requestVersion === state.diffVersion) {
+        state.diffPendingKey = "";
+        state.diffPromise = null;
+      }
+    }
+  })();
+  return state.diffPromise;
 }
 
 function diffImage() {
-  if (!state.sourceImage || !state.resultImage) return null;
-  const gain = Math.min(255, Number($("diff-gain").value));
-  const channel = $("diff-channel").value;
-  const key = `${state.source.id}:${state.result.id}:${gain}:${channel}`;
-  if (state.diffKey === key) return state.diffCanvas;
-  if (!state.pair) { prepareDiffPixels(); return null; }
-  const { a, b } = state.pair;
-  const canvas = document.createElement("canvas");
-  canvas.width = state.sourceImage.naturalWidth;
-  canvas.height = state.sourceImage.naturalHeight;
-  const context = canvas.getContext("2d");
-  const output = context.createImageData(canvas.width, canvas.height);
-  const pixels = output.data;
-  for (let index = 0; index < a.length; index += 4) {
-    const alpha = Math.abs(a[index + 3] - b[index + 3]);
-    for (let color = 0; color < 3; color++) {
-      const delta = Math.abs(a[index + color] - b[index + color]);
-      pixels[index + color] = Math.floor(Math.min(255, (channel === "alpha" ? alpha : channel === "rgb" ? delta : Math.max(delta, alpha)) * gain));
-    }
-    pixels[index + 3] = 255;
-  }
-  context.putImageData(output, 0, 0);
-  state.diffCanvas = canvas;
-  state.diffKey = key;
-  return canvas;
+  const options = diffOptions();
+  if (!options) return null;
+  if (state.diffKey === options.key) return state.diffCanvas;
+  if (state.diffFailedKey !== options.key) ensureDiff(options);
+  return null;
 }
 
 function requestDraw() {
@@ -714,20 +775,24 @@ function deletePreset() {
 
 function scheduleRestore() {
   clearTimeout(restoreTimer);
-  if (!state.clean || !state.source || state.busy) {
+  const version = supersedeRestore();
+  state.resultVersion++;
+  if (!state.clean || !state.source || state.busy || state.uploading) {
+    state.restoring = false;
+    updateCards();
     return;
   }
-  const version = ++state.restoreVersion;
-  restoreController?.abort();
+  state.restoring = true;
+  updateCards();
   restoreTimer = setTimeout(async () => {
     restoreController = new AbortController();
-    state.restoring = true; updateCards();
     setText("live-status", "Updating detail restoration…");
     try {
       const generation = state.generation;
-      const result = await api("/api/restore", { source_id: state.source.id, clean_id: state.clean.id, params: settings() }, { signal: restoreController.signal });
-      if (version !== state.restoreVersion || generation !== state.generation) return;
-      await useResult(result.result, result.metrics, state.clean);
+      const clean = state.clean;
+      const result = await api("/api/restore", { client_id: restoreClientId, revision: version, source_id: state.source.id, clean_id: clean.id, params: settings() }, { signal: restoreController.signal });
+      if (result.superseded || version !== state.restoreVersion || generation !== state.generation) return;
+      await useResult(result.result, result.metrics, clean, () => version === state.restoreVersion);
     } catch (error) { if (error.name !== "AbortError" && version === state.restoreVersion) toast(error.message, true); }
     finally { if (version === state.restoreVersion) { state.restoring = false; updateCards(); } }
   }, 300);
@@ -748,15 +813,12 @@ function busy(value) {
 }
 
 async function processImage() {
-  if (state.busy || state.refreshing || state.settingsDraft || !state.source || !state.runtime?.ready || !state.environmentReady) return;
+  if (state.busy || state.uploading || state.refreshing || state.settingsDraft || !state.source || !state.runtime?.ready || !state.environmentReady) return;
   try {
     const params = settings();
     const problem = configurationProblem(params);
     if (problem) throw new Error(problem);
-    clearTimeout(restoreTimer);
-    state.restoreVersion++;
-    restoreController?.abort();
-    state.restoring = false;
+    cancelRestore();
     busy(true);
     state.dirty = false;
     $("progress-bar").value = 0;
@@ -803,16 +865,26 @@ async function watchJob(id) {
 }
 
 async function download() {
+  if (state.exporting || state.uploading || state.restoring) return;
   if (state.mode === "diff") {
-    await prepareDiffPixels();
-    const canvas = diffImage();
-    if (!canvas) return;
-    canvas.toBlob((blob) => {
-      if (!blob) { toast("Could not export the diff.", true); return; }
+    const options = diffOptions();
+    if (!options) return;
+    const version = state.pairVersion;
+    const generation = state.generation;
+    const name = `${options.source.name.replace(/\.[^.]+$/, "")}_diff_${options.channel}_x${options.gain}.png`;
+    state.exporting = true;
+    updateCards();
+    try {
+      const canvas = await ensureDiff(options);
+      if (!canvas || version !== state.pairVersion || generation !== state.generation || options.key !== diffOptions()?.key) return;
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (version !== state.pairVersion || generation !== state.generation || options.key !== diffOptions()?.key) return;
+      if (!blob) throw new Error("Could not export the diff.");
       const url = URL.createObjectURL(blob);
-      downloadUrl(url, `${state.source.name.replace(/\.[^.]+$/, "")}_diff_${$("diff-channel").value}_x${$("diff-gain").value}.png`);
+      downloadUrl(url, name);
       setTimeout(() => URL.revokeObjectURL(url), 10000);
-    }, "image/png");
+    } catch (error) { toast(error.message, true); }
+    finally { state.exporting = false; updateCards(); }
   } else {
     const asset = state.mode === "original" ? state.source : state.result;
     if (asset) downloadUrl(asset.url, asset.name.replace(/\.[^.]+$/, "") + ".png");
@@ -921,18 +993,29 @@ async function initialize() {
     setText("model-label", session.models?.[0]?.name || "No models found");
     const activeJob = session.active_job_id ? await api(`/api/job/${session.active_job_id}`) : null;
     const source = session.assets?.find((asset) => asset.id === (activeJob?.source_id || selection.source)) || session.assets?.find((asset) => asset.id === session.default_source_id);
-    const result = session.assets?.find((asset) => asset.id === selection.result) || (!activeJob && source?.id === session.default_source_id ? session.assets?.find((asset) => asset.id === session.default_result_id) : null);
+    const result = !activeJob ? session.assets?.find((asset) => asset.id === selection.result) || (source?.id === session.default_source_id ? session.assets?.find((asset) => asset.id === session.default_result_id) : null) : null;
     const clean = session.assets?.find((asset) => asset.id === selection.clean && asset.kind === "clean") || null;
     if (source) {
       await useSource(source);
-      if (result && result.width === source.width && result.height === source.height) { await useResult(result, null, clean); setMode("split"); }
+      if (result && result.width === source.width && result.height === source.height) {
+        await useResult(result, null, clean);
+        setMode("split");
+        // Settings are saved before the debounced restoration completes. A
+        // reload can therefore recover newer controls with an older result.
+        // Rebuild from the clean image before allowing that result to export.
+        scheduleRestore();
+      }
     }
     if (!session.ready) toast("Run make setup to enable processing. Image comparison is available.");
     if (activeJob) {
       busy(true);
-      try { await watchJob(activeJob.id); }
+      let completed = false;
+      try { await watchJob(activeJob.id); completed = true; }
       catch (error) { toast(error.message, true); setText("live-status", `Error: ${error.message}`); }
       finally { busy(false); }
+      // A reconnected job may have started with restoration settings from a
+      // different tab. Apply this tab's controls to its newly generated clean.
+      if (completed && state.source?.id === activeJob.source_id) scheduleRestore();
     }
   } catch (error) { setText("live-status", "Cannot connect to the local server."); toast(error.message, true); }
 }

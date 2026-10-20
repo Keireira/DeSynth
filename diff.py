@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from processing import load_rgba as load_normalized_rgba
 
 
 def positive_gain(value: str) -> float:
@@ -22,8 +23,7 @@ def positive_gain(value: str) -> float:
 
 def load_rgba(path: Path) -> np.ndarray:
     try:
-        with Image.open(path) as image:
-            return np.array(image.convert("RGBA"))
+        return np.array(load_normalized_rgba(path))
     except (OSError, ValueError) as exc:
         raise ValueError(f"Cannot read image '{path}': {exc}") from exc
 

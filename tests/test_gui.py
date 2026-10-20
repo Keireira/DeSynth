@@ -71,6 +71,7 @@ class GuiHTTPTests(unittest.TestCase):
 
     def tearDown(self):
         self.connection.close()
+        self.studio.close()
 
     def add_fake_cuda_devices(self):
         for index in (0, 1):
@@ -356,7 +357,8 @@ class GuiHTTPTests(unittest.TestCase):
         cached = {key: FakeTensor(dtype) for key, dtype in original_dtypes.items()}
         metadata = {"model": "Qwen-Image", "prompt": "", "version": 1}
         cached["meta"] = metadata
-        build = Mock(side_effect=lambda *_args, **_kwargs: SimpleNamespace(num_timesteps=2))
+        set_adapters = Mock()
+        build = Mock(side_effect=lambda *_args, **_kwargs: SimpleNamespace(num_timesteps=2, set_adapters=set_adapters))
         sample = Mock(side_effect=lambda _pipe, image, _embeds, **_kwargs: image)
         free = Mock()
         load = Mock(return_value=cached)
@@ -377,8 +379,8 @@ class GuiHTTPTests(unittest.TestCase):
             ("cuda:1", "model", "float32", 8, .8, 4),        # Precision alone changes.
             ("cpu", "none", "float32", 8, .8, 5),
             ("cpu", "none", "float32", 4, .8, 6),          # Adapter alone changes.
-            ("cpu", "none", "float32", 4, .6, 7),          # Adapter strength alone changes.
-            ("cpu", "none", "float32", 4, .6, 7),
+            ("cpu", "none", "float32", 4, .6, 6),          # Strength updates the existing adapter.
+            ("cpu", "none", "float32", 4, .6, 6),
         )
         with patch.object(self.studio, "state", return_value={"ready": True}):
             for device, offload, precision, profile, scale, expected_builds in cases:
@@ -397,11 +399,12 @@ class GuiHTTPTests(unittest.TestCase):
                     self.assertEqual(build.call_count, expected_builds)
                     self.assertEqual(self.studio.pipe_key, (
                         gui.weight_identity(self.root / "test.gguf"), gui.weight_identity(self.root / adapter),
-                        scale, device, offload, precision,
+                        device, offload, precision,
                     ))
+                    self.assertEqual(self.studio.pipe_scale, scale)
                     self.assertEqual(build.call_args.kwargs, {
                         "device": device, "offload": offload, "compute_dtype": precision,
-                        "lightning_lora": self.root / adapter, "lightning_scale": scale,
+                        "lightning_lora": self.root / adapter, "lightning_scale": .8,
                     })
                     prepared = sample.call_args.args[2]
                     self.assertNotIn("meta", prepared)
@@ -412,7 +415,8 @@ class GuiHTTPTests(unittest.TestCase):
                     self.assertEqual(finished["runtime"]["offload"], offload)
                     self.assertEqual(finished["runtime"]["precision"], precision)
         load.assert_called_once()
-        self.assertEqual(free.call_count, 6)
+        self.assertEqual(free.call_count, 5)
+        set_adapters.assert_called_once_with(["lightning"], adapter_weights=[.6])
         for key in original_dtypes:
             tensor = cached[key]
             self.assertEqual(tensor.device, "cpu")
@@ -435,7 +439,8 @@ class GuiHTTPTests(unittest.TestCase):
         fake_load = Mock(side_effect=RuntimeError("Synthetic model-load failure"))
         self.studio.module = SimpleNamespace(
             DEVICE="cpu", EMBEDS_CACHE=self.root / "unused.pt",
-            torch=SimpleNamespace(load=fake_load, float32="float32"), _is_oom=lambda _error: False,
+            torch=SimpleNamespace(load=fake_load, float32="float32"),
+            _is_oom=lambda _error: False, _free_pipeline=Mock(),
         )
         with patch.object(self.studio, "state", return_value={"ready": True}), patch.object(gui.traceback, "print_exc"):
             status, job, _headers = self.request("/api/process", {"source_id": source["id"], "params": {"seed": 42}})
