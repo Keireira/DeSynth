@@ -141,10 +141,12 @@ def _free_pipeline(pipe) -> None:
 # HF repo used only for tiny configs and the ~250MB VAE.
 QWEN_IMAGE_REPO = "Qwen/Qwen-Image"
 
-# Lightning is a 4-step LoRA. We run at 8 steps so denoise quantizes to 1/8;
-# 2/8 = 0.25 is the minimum that defeats SynthID. Lower = no-op (input passes
-# through). Higher = more drift, no extra benefit.
-DEFAULT_STEPS = 8
+# Img2img slices the total schedule according to denoise (see the effective
+# step helper above for the pipeline's rounding). The 8-step adapter
+# therefore defaults to 32 total steps at strength 0.25. Keep the previous
+# 8-total-step profile when only the legacy 4-step adapter is available.
+# Explicit --steps values are always used as supplied.
+DEFAULT_STEPS = default_steps_for_lightning(LIGHTNING_LORA)
 CFG = 1.0
 DEFAULT_DENOISE = 0.25
 # SynthID's spatial cutoff is at ~2px. 1.95 is the safe ceiling that takes
@@ -197,13 +199,18 @@ def _place_pipeline(pipe, device: str, offload: str = "auto") -> None:
 def build_pipeline(
     transformer_path: Path = GGUF_TRANSFORMER, *, device: str | None = None,
     offload: str = "auto", compute_dtype: torch.dtype | None = None,
+    lightning_lora: Path | None = None, lightning_scale: float = DEFAULT_LIGHTNING_SCALE,
 ) -> QwenImageImg2ImgPipeline:
+    transformer_path = resolve_model_path(transformer_path)
+    lightning_lora = resolve_model_path(lightning_lora or LIGHTNING_LORA)
+    if not math.isfinite(lightning_scale) or lightning_scale <= 0:
+        raise ValueError("Lightning scale must be a finite number greater than zero.")
     target = torch.device(device or DEVICE)
     dtype = compute_dtype or (torch.float32 if target.type == "cpu" else COMPUTE_DTYPE)
     if target.type == "cpu" and dtype != torch.float32:
         raise ValueError("CPU processing requires float32 precision.")
-    for p in (transformer_path, LIGHTNING_LORA, EMBEDS_CACHE):
-        if not p.exists():
+    for p in (transformer_path, lightning_lora, EMBEDS_CACHE):
+        if not _nonempty_file(p):
             raise FileNotFoundError(
                 f"{p}\n(Run `python precompute_embeds.py` first if embeds_cache.pt is missing.)"
             )
@@ -232,6 +239,26 @@ def build_pipeline(
         dtype=dtype,
     )
 
+    # Both Lightning profiles are distilled with shift=3. Match their official
+    # FlowMatch schedule, including disabling the base model's terminal shift.
+    # https://github.com/ModelTC/LightX2V-Qwen-Image-Lightning/blob/main/generate_with_diffusers.py
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config({
+        "base_image_seq_len": 256,
+        "base_shift": math.log(3),
+        "invert_sigmas": False,
+        "max_image_seq_len": 8192,
+        "max_shift": math.log(3),
+        "num_train_timesteps": 1000,
+        "shift": 1.0,
+        "shift_terminal": None,
+        "stochastic_sampling": False,
+        "time_shift_type": "exponential",
+        "use_beta_sigmas": False,
+        "use_dynamic_shifting": True,
+        "use_exponential_sigmas": False,
+        "use_karras_sigmas": False,
+    })
+
     # No text encoder loaded — embeds are precomputed.
     pipe = _load(
         QwenImageImg2ImgPipeline.from_pretrained,
@@ -240,6 +267,7 @@ def build_pipeline(
         vae=vae,
         text_encoder=None,
         tokenizer=None,
+        scheduler=scheduler,
         dtype=dtype,
     )
 
@@ -248,12 +276,13 @@ def build_pipeline(
     # the file by default; tensors are only paged into RAM when accessed.
     try:
         from safetensors.torch import load_file as _st_load
-        _lora_sd = _st_load(str(LIGHTNING_LORA), device="cpu")
+        _lora_sd = _st_load(str(lightning_lora), device="cpu")
         pipe.load_lora_weights(_lora_sd, adapter_name="lightning")
     except Exception:
         # Fallback: let diffusers handle it normally (heap allocation).
-        pipe.load_lora_weights(str(LIGHTNING_LORA), adapter_name="lightning")
-    pipe.set_adapters(["lightning"], adapter_weights=[0.8])
+        pipe.load_lora_weights(str(lightning_lora), adapter_name="lightning")
+    pipe.set_adapters(["lightning"], adapter_weights=[lightning_scale])
+    print(f"[lightning] {lightning_lora.name}  scale={lightning_scale:g}")
 
     _place_pipeline(pipe, str(target), offload)
     pipe.vae.enable_tiling()
