@@ -21,7 +21,7 @@ import webbrowser
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from PIL import Image, UnidentifiedImageError
 from PIL.PngImagePlugin import PngInfo
@@ -32,7 +32,7 @@ from processing import finish_image, normalize_rgba, oriented_size, prepare_imag
 
 ROOT = Path(__file__).resolve().parent
 STORE = ROOT / "out" / "gui"
-WEB = ROOT / "web"
+WEB = ROOT / "web" / "dist"
 MAX_BODY = 48 * 1024 * 1024
 MAX_IMAGE = 32 * 1024 * 1024
 MAX_PIXELS = 36_000_000
@@ -830,14 +830,28 @@ class Handler(BaseHTTPRequestHandler):
                     if job["status"] in ("running", "queued"):
                         job["elapsed"] = round(time.monotonic() - self.studio.started[job["id"]], 1)
                     return self.send_json(200, dict(job))
-            files = {"/": ("index.html", "text/html; charset=utf-8"), "/index.html": ("index.html", "text/html; charset=utf-8"),
-                     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-                     "/diff-worker.js": ("diff-worker.js", "text/javascript; charset=utf-8"),
-                     "/style.css": ("style.css", "text/css; charset=utf-8"), "/styles.css": ("style.css", "text/css; charset=utf-8")}
-            if path not in files:
+            relative = unquote(path).lstrip("/") or "index.html"
+            if "\\" in relative or "\x00" in relative or any(part.startswith(".") for part in relative.split("/")):
                 raise APIError("Not found.", 404)
-            filename, mime = files[path]
-            return self.send_bytes(200, (WEB / filename).read_bytes(), mime)
+            filename = (WEB / relative).resolve()
+            if not filename.is_relative_to(WEB.resolve()):
+                raise APIError("Not found.", 404)
+            if not (WEB / "index.html").is_file():
+                raise APIError("The editor has not been built. Run make web-build, then reload.", 503)
+            if not filename.is_file():
+                raise APIError("Not found.", 404)
+            types = {
+                ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8",
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".svg": "image/svg+xml", ".ico": "image/x-icon", ".webp": "image/webp",
+                ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf",
+                ".txt": "text/plain; charset=utf-8",
+            }
+            mime = types.get(filename.suffix.lower())
+            if not mime:
+                raise APIError("Not found.", 404)
+            return self.send_bytes(200, filename.read_bytes(), mime)
         except APIError as exc:
             self.send_json(exc.status, {"error": str(exc)})
         except (BrokenPipeError, ConnectionResetError):

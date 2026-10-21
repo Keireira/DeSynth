@@ -25,3 +25,5 @@ RAW_OUT ?=
 GAIN ?= 8
 PORT ?= 8758
 GUI_ARGS ?=
+PNPM ?= pnpm
+WEB_PORT ?= 3000

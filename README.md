@@ -33,7 +33,8 @@ the original dimensions and alpha channel.
 
 ### Setup
 
-Install **Python 3.11** and **GNU Make**, then run from the repository folder:
+Install **Python 3.11**, **Node.js 24 LTS**, **pnpm** and **GNU Make**, then run
+from the repository folder:
 
 ```sh
 make setup
@@ -42,6 +43,7 @@ make gui
 
 Setup installs dependencies and downloads models into `ai/`. The default is
 **Q4_K_M**, the smaller model. Keep the included `embeds_cache.pt`.
+The editor is built from `web/`; `make gui` rebuilds it before starting.
 
 For CPU-only installation, use `make setup BACKEND=cpu`.
 Use `make doctor` to check setup and `make help` to list commands.
@@ -83,6 +85,24 @@ added models; **Save settings** applies choices. Sequential offload uses RAM to
 reduce VRAM use. Leave Precision on Auto.
 
 ![Model, device and preset settings](docs/images/settings.jpg)
+
+For frontend development, keep the backend running and open the React dev server:
+
+```sh
+# First terminal
+make gui GUI_ARGS="--no-browser"
+
+# Second terminal: http://127.0.0.1:3000
+make web-dev
+```
+
+`make web-check` runs TypeScript, lint, formatting checks and frontend tests.
+`make web-format` applies the shared root formatting rules.
+
+The frontend follows [Feature-Sliced Design](https://habr.com/ru/companies/inDrive/articles/693768/):
+`app → pages → widgets → features → entities → shared`. Slices expose public
+`index.ts` APIs and import lower layers. `make web-check` also checks these
+boundaries and circular imports.
 
 ### CLI
 

@@ -1,0 +1,44 @@
+{
+  "languages": {
+    "TypeScript": {
+      "language_servers": ["oxc", "!biome", "..."],
+      "format_on_save": "on",
+      "formatter": {
+        "external": {
+          "command": "node",
+          "arguments": ["node_modules/oxfmt/bin/oxfmt", "--stdin-filepath", "{buffer_path}"]
+        }
+      }
+    },
+    "TSX": {
+      "language_servers": ["oxc", "!biome", "..."],
+      "format_on_save": "on",
+      "formatter": {
+        "external": {
+          "command": "node",
+          "arguments": ["node_modules/oxfmt/bin/oxfmt", "--stdin-filepath", "{buffer_path}"]
+        }
+      }
+    },
+    "JavaScript": {
+      "language_servers": ["oxc", "!biome", "..."],
+      "format_on_save": "on",
+      "formatter": {
+        "external": {
+          "command": "node",
+          "arguments": ["node_modules/oxfmt/bin/oxfmt", "--stdin-filepath", "{buffer_path}"]
+        }
+      }
+    },
+    "JSON": {
+      "language_servers": ["npm-package-json-checker", "!biome", "..."],
+      "format_on_save": "on",
+      "formatter": {
+        "external": {
+          "command": "node",
+          "arguments": ["node_modules/oxfmt/bin/oxfmt", "--stdin-filepath", "{buffer_path}"]
+        }
+      }
+    }
+  }
+}

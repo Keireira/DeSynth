@@ -1,4 +1,23 @@
-.venv
+# Local environments, dependencies and build output.
+.venv/
+node_modules/
+.pnpm-store/
+dist/
+.rspack-profile-*/
+*.tsbuildinfo
+/web/*.local
+/web/*.log*
+
+# Editor, machine and local environment files.
+.idea/
+.claude/
+.DS_Store
+.env*.local
+*.pem
+*.key
+npm-debug.*
+yarn-debug.*
+yarn-error.*
 
 # Python bytecode and model download metadata.
 __pycache__/

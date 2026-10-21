@@ -6,6 +6,7 @@
 include make/config.mk
 include make/setup.mk
 include make/run.mk
+include make/web.mk
 
 .PHONY: help
 help:
@@ -19,6 +20,10 @@ help:
 	@echo make prepare - cache the VAE and pipeline configs
 	@echo make doctor  - check dependencies, device and model assets
 	@echo make gui    - open the local image editor and comparison workspace
+	@echo make web-build - install frontend dependencies and build the editor
+	@echo make web-dev - start the React dev server, with the backend running on PORT
+	@echo make web-check - typecheck, lint, format check and frontend tests
+	@echo make web-format - format frontend and shared JavaScript configs
 	@echo make run INPUT=original.png
 	@echo make compare INPUT=original.png OUTPUT=out/your_result.png
 	@echo make visual INPUT=original.png OUTPUT=out/your_result.png

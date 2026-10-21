@@ -1,6 +1,6 @@
 .PHONY: gui run compare visual diff
 
-gui: | venv
+gui: web-build | venv
 	"$(VENV_PYTHON)" gui.py --port "$(PORT)" $(GUI_ARGS)
 
 run: | venv

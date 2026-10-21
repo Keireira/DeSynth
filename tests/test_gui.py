@@ -121,6 +121,48 @@ class GuiHTTPTests(unittest.TestCase):
             time.sleep(.01)
         self.fail("Worker did not finish within three seconds")
 
+    def test_built_editor_serves_hashed_scripts_styles_and_worker(self):
+        with tempfile.TemporaryDirectory(prefix="desynth-web-test-") as directory:
+            web = Path(directory)
+            (web / "static" / "js").mkdir(parents=True)
+            (web / "static" / "css").mkdir(parents=True)
+            files = {
+                "/": ("index.html", b"<title>DeSynth</title>", "text/html"),
+                "/static/js/index.a123.js": ("static/js/index.a123.js", b"export {};", "text/javascript"),
+                "/static/js/worker.b456.js": ("static/js/worker.b456.js", b"self.onmessage = () => {};", "text/javascript"),
+                "/static/css/index.c789.css": ("static/css/index.c789.css", b"body { margin: 0; }", "text/css"),
+            }
+            for filename, data, _mime in files.values():
+                (web / filename).write_bytes(data)
+            with patch.object(gui, "WEB", web):
+                for path, (_filename, data, mime) in files.items():
+                    with self.subTest(path=path):
+                        status, content, headers = self.request(path)
+                        self.assertEqual(status, 200)
+                        self.assertEqual(content, data)
+                        self.assertTrue(headers["Content-Type"].startswith(mime))
+                        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+
+    def test_static_paths_cannot_escape_build_directory(self):
+        with tempfile.TemporaryDirectory(prefix="desynth-web-test-") as directory:
+            parent = Path(directory)
+            web = parent / "dist"
+            web.mkdir()
+            (web / "index.html").write_text("DeSynth", encoding="utf-8")
+            (parent / "private.json").write_text('{"secret": true}', encoding="utf-8")
+            with patch.object(gui, "WEB", web):
+                for path in ("/../private.json", "/%2e%2e/private.json", "/%2e%2e%5cprivate.json",
+                             "/F:%5cprivate.json", "/.hidden.js", "/missing.js"):
+                    with self.subTest(path=path):
+                        status, _content, _headers = self.request(path)
+                        self.assertEqual(status, 404)
+
+    def test_missing_frontend_build_explains_make_command(self):
+        with patch.object(gui, "WEB", self.root / "missing-build"):
+            status, content, _headers = self.request("/")
+        self.assertEqual(status, 503)
+        self.assertIn("make web-build", content["error"])
+
     def test_rgba_pixels_preserve_colors_under_zero_and_partial_alpha(self):
         image = Image.new("RGBA", (2, 1))
         image.putdata([(255, 0, 173, 0), (7, 199, 53, 17)])
