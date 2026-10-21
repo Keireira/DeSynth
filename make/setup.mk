@@ -1,5 +1,20 @@
-.PHONY: setup venv install models prepare doctor
+.PHONY: setup setup-project tools require-environment
 
-# The Python helper keeps bootstrap steps portable and setup sequential.
-setup venv install models prepare doctor:
-	$(PYTHON) scripts/project.py $@ --venv "$(VENV)" --backend "$(BACKEND)" --model "$(MODEL)" --lightning "$(LIGHTNING)"
+# Bootstrap before the recursive make reads the generated local environment.
+setup: tools
+	$(MAKE) setup-project
+
+tools:
+ifeq ($(OS),Windows_NT)
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bootstrap.ps1 -Venv "$(VENV)"
+else
+	sh scripts/bootstrap.sh --venv "$(VENV)"
+endif
+
+setup-project: web-build backend-build
+	"$(DESYNTH)" setup $(ENVIRONMENT_ARGS)
+
+require-environment:
+ifeq ($(wildcard .tools/environment.mk),)
+	$(error Run make setup first to prepare the local project environment)
+endif

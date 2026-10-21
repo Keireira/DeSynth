@@ -1,0 +1,23 @@
+{
+  "name": "desynth",
+  "private": true,
+  "scripts": {
+    "build": "pnpm --filter desynth-web build",
+    "dev": "pnpm --filter desynth-web dev",
+    "preview": "pnpm --filter desynth-web preview",
+    "test": "pnpm --filter desynth-web test",
+    "typecheck": "pnpm --filter desynth-web typecheck",
+    "lint": "oxlint --deny-warnings web/src web/rsbuild.config.ts web/vitest.config.ts scripts/web-dev.mjs",
+    "format": "oxfmt --write \"web/src/**/*.{ts,tsx}\" \"web/*.ts\" scripts/web-dev.mjs web/package.json web/tsconfig.json package.json pnpm-workspace.yaml .oxfmtrc.json .oxlintrc.json .zed/settings.json",
+    "format:check": "oxfmt --check \"web/src/**/*.{ts,tsx}\" \"web/*.ts\" scripts/web-dev.mjs web/package.json web/tsconfig.json package.json pnpm-workspace.yaml .oxfmtrc.json .oxlintrc.json .zed/settings.json",
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test"
+  },
+  "devDependencies": {
+    "oxfmt": "^0.74.0",
+    "oxlint": "^1.89.0"
+  },
+  "engines": {
+    "node": "^22.13.0 || ^24.0.0 || >=26.0.0"
+  },
+  "packageManager": "pnpm@10.30.3"
+}

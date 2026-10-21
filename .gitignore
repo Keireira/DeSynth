@@ -1,4 +1,25 @@
-.venv
+# Local environments, dependencies and build output.
+.venv/
+.tools/
+node_modules/
+.pnpm-store/
+dist/
+target/
+.rspack-profile-*/
+*.tsbuildinfo
+/web/*.local
+/web/*.log*
+
+# Editor, machine and local environment files.
+.idea/
+.claude/
+.DS_Store
+.env*.local
+*.pem
+*.key
+npm-debug.*
+yarn-debug.*
+yarn-error.*
 
 # Python bytecode and model download metadata.
 __pycache__/
@@ -8,6 +29,9 @@ __pycache__/
 # Large downloaded model weights.
 *.gguf
 *.safetensors
+/inference/models/.*.part
+/inference/models/.*.part.json
+/inference/models/.*.download.lock
 
 # Keep reference results from original.png; ignore other outputs and caches.
 /out/*

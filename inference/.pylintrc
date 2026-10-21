@@ -1,0 +1,20 @@
+[MAIN]
+py-version=3.11
+recursive=yes
+
+[FORMAT]
+max-line-length=120
+
+[MESSAGES CONTROL]
+disable=missing-function-docstring,missing-class-docstring,too-few-public-methods
+
+[DESIGN]
+max-args=8
+max-positional-arguments=8
+max-locals=25
+max-branches=20
+max-statements=75
+
+[REPORTS]
+reports=no
+score=no
