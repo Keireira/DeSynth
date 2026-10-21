@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import gc
-import logging
 import math
 import os
 from pathlib import Path
@@ -11,10 +10,7 @@ import warnings
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-for message in (".*not writable.*", ".*pooled_projection_dim.*", ".*classifier-free guidance is not enabled.*"):
-    warnings.filterwarnings("ignore", message=message)
-logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-logging.getLogger("diffusers").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*not writable.*")
 
 # Configure the libraries before their imports can emit warnings or contact HF.
 # pylint: disable=wrong-import-position
@@ -28,11 +24,12 @@ from diffusers import (
     QwenImageTransformer2DModel,
 )
 from PIL import Image
+from huggingface_hub import hf_hub_download
 
 from diffusers_compat import apply_gguf_patches, load_cached
+from model_assets import QWEN_IMAGE_REPO, QWEN_TRANSFORMER_REPO
 # pylint: enable=wrong-import-position
 
-QWEN_IMAGE_REPO = "Qwen/Qwen-Image"
 LIGHTNING_SCHEDULER_SHIFT = 3.0
 EMBED_KEYS = ("prompt_embeds", "negative_prompt_embeds", "prompt_embeds_mask", "negative_prompt_embeds_mask")
 
@@ -98,19 +95,24 @@ def build_pipeline(transformer: Path, lightning: Path, device: str, offload: str
     offload = resolved_offload(device, offload)
     dtype = getattr(torch, precision)
     apply_gguf_patches()
+    transformer_config = load_cached(
+        hf_hub_download, repo_id=QWEN_TRANSFORMER_REPO, filename="transformer/config.json",
+    )
     model = load_cached(
         QwenImageTransformer2DModel.from_single_file,
         pretrained_model_link_or_path_or_dict=str(transformer),
         quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
         dtype=dtype,
-        config=QWEN_IMAGE_REPO,
-        subfolder="transformer",
+        config=transformer_config,
     )
-    vae = load_cached(
-        AutoencoderKLQwenImage.from_pretrained,
-        pretrained_model_name_or_path=QWEN_IMAGE_REPO,
-        subfolder="vae",
-        dtype=dtype,
+    vae_config = load_cached(hf_hub_download, repo_id=QWEN_IMAGE_REPO, filename="vae/config.json")
+    # HF returns a snapshots/<revision>/vae/config.json path. Keep weights on that revision.
+    vae_weights = load_cached(
+        hf_hub_download, repo_id=QWEN_IMAGE_REPO, filename="vae/diffusion_pytorch_model.safetensors",
+        revision=Path(vae_config).parent.parent.name,
+    )
+    vae = AutoencoderKLQwenImage.from_pretrained(
+        str(Path(vae_weights).parent), dtype=dtype, local_files_only=True,
     )
     scheduler = FlowMatchEulerDiscreteScheduler.from_config({
         "base_image_seq_len": 256,
@@ -155,8 +157,6 @@ def sample(pipe, image, embeds, *, denoise: float, steps: int, seed: int, callba
         image=image,
         prompt_embeds=embeds["prompt_embeds"].unsqueeze(0),
         prompt_embeds_mask=embeds["prompt_embeds_mask"].unsqueeze(0),
-        negative_prompt_embeds=embeds["negative_prompt_embeds"].unsqueeze(0),
-        negative_prompt_embeds_mask=embeds["negative_prompt_embeds_mask"].unsqueeze(0),
         num_inference_steps=len(sigmas),
         sigmas=sigmas,
         true_cfg_scale=1.0,
@@ -224,7 +224,7 @@ class Runtime:
         self.embeds_key = embeds_key
         dtype = getattr(torch, request["precision"])
         embeds = {key: value.to(device=request["device"], dtype=dtype if value.is_floating_point() else value.dtype)
-                  for key, value in self.embeds.items()}
+                  for key, value in self.embeds.items() if key in ("prompt_embeds", "prompt_embeds_mask")}
         current = image
         passes = request["passes"]
         actual_steps = effective_img2img_steps(request["steps"], request["denoise"])

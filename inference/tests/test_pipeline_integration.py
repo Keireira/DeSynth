@@ -26,6 +26,8 @@ def configured_scheduler():
     captured = {}
 
     def load(_loader, **kwargs):
+        if _loader is ds.hf_hub_download:
+            return str(Path("cache/snapshots/revision") / kwargs["filename"])
         if "scheduler" in kwargs:
             captured["scheduler"] = kwargs["scheduler"]
             return pipe
@@ -33,6 +35,7 @@ def configured_scheduler():
 
     with patch.object(ds, "apply_gguf_patches"), \
             patch.object(ds, "load_cached", side_effect=load), \
+            patch.object(ds.AutoencoderKLQwenImage, "from_pretrained", return_value=Mock()), \
             patch.object(ds, "place_pipeline"), \
             patch("safetensors.torch.load_file", return_value={}):
         ds.build_pipeline(Path("test.gguf"), Path("test.safetensors"), "cpu", "none", "float32", .8)
@@ -129,7 +132,8 @@ class PipelineIntegrationTests(unittest.TestCase):
 
                     self.pipe.transformer.calls.clear()
                     self.pipe.transformer.contexts.clear()
-                    result = self.sample(size, denoise, steps, seed, partial(record_step, callbacks))
+                    with self.assertNoLogs("diffusers", level="WARNING"):
+                        result = self.sample(size, denoise, steps, seed, partial(record_step, callbacks))
                     count = ds.effective_img2img_steps(steps, denoise)
                     noise = torch.randn((1, 1, 16, size[1] // 8, size[0] // 8),
                                         generator=torch.Generator().manual_seed(seed))

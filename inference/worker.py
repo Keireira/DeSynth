@@ -11,6 +11,8 @@ import re
 import sys
 import traceback
 
+from model_assets import CACHE_FILES
+
 # Probing and release must work before the optional model stack is installed.
 # pylint: disable=import-outside-toplevel
 
@@ -21,8 +23,6 @@ os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 
 MAX_COMMAND_BYTES = 65536
 DEPENDENCIES = ("torch", "diffusers", "transformers", "accelerate", "peft", "gguf", "safetensors", "numpy", "PIL")
-CACHE_FILES = ("model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json",
-               "transformer/config.json", "vae/config.json", "vae/diffusion_pytorch_model.safetensors")
 
 
 def emit(identifier, event, **fields):
@@ -178,13 +178,13 @@ def main():
                 from huggingface_hub import hf_hub_download
                 from huggingface_hub.errors import LocalEntryNotFoundError
 
-                for index, filename in enumerate(CACHE_FILES):
+                for index, (repo_id, filename) in enumerate(CACHE_FILES):
                     emit(identifier, "progress", progress=100 * index / len(CACHE_FILES), stage=f"Caching {filename}")
                     try:
-                        hf_hub_download("Qwen/Qwen-Image", filename, local_files_only=True)
+                        hf_hub_download(repo_id, filename, local_files_only=True)
                     except LocalEntryNotFoundError:
-                        hf_hub_download("Qwen/Qwen-Image", filename)
-                result = {"cached": list(CACHE_FILES)}
+                        hf_hub_download(repo_id, filename)
+                result = {"cached": [filename for _, filename in CACHE_FILES]}
             elif operation == "sample":
                 validate_sample(request)
                 emit(identifier, "progress", progress=2, stage="Loading inference libraries")

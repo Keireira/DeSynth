@@ -76,6 +76,19 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not supported on MPS"):
                 inference.validate_sample({**request, "device": "mps", "offload": "sequential"})
 
+    def test_prepare_caches_the_matching_transformer_config(self):
+        command = io.BytesIO(b'{"id":1,"op":"prepare"}\n')
+        with (patch.object(sys, "stdin", SimpleNamespace(buffer=command)),
+              patch.object(inference, "emit") as emit,
+              patch("huggingface_hub.hf_hub_download") as download):
+            inference.main()
+
+        configs = {(call.args[0], call.args[1]) for call in download.call_args_list}
+        self.assertIn(("Qwen/Qwen-Image-2512", "transformer/config.json"), configs)
+        self.assertNotIn(("Qwen/Qwen-Image", "transformer/config.json"), configs)
+        self.assertIn(("Qwen/Qwen-Image", "vae/diffusion_pytorch_model.safetensors"), configs)
+        self.assertEqual(emit.call_args.args, (1, "result"))
+
 
 class SamplingTests(unittest.TestCase):
     @staticmethod
@@ -119,6 +132,9 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual((args["width"], args["height"]), (32, 16))
         self.assertEqual(args["num_inference_steps"], 8)
         self.assertEqual(args["strength"], 1.0)
+        self.assertEqual(args["true_cfg_scale"], 1.0)
+        self.assertNotIn("negative_prompt_embeds", args)
+        self.assertNotIn("negative_prompt_embeds_mask", args)
         self.assertIs(args["callback_on_step_end"], callback)
         self.assertTrue(torch.equal(args["prompt_embeds_mask"], embeds["prompt_embeds_mask"].unsqueeze(0)))
         np.testing.assert_allclose(args["sigmas"], runtime.img2img_sigmas(32, .25))
@@ -134,6 +150,7 @@ class SamplingTests(unittest.TestCase):
             def sample(selected, image, embeds, **kwargs):
                 self.assertIs(selected, pipe)
                 self.assertEqual(embeds["prompt_embeds_mask"].dtype, torch.int64)
+                self.assertEqual(set(embeds), {"prompt_embeds", "prompt_embeds_mask"})
                 samples.append(kwargs["seed"])
                 callbacks.append(kwargs["callback_on_step_end"])
                 kwargs["callback_on_step_end"](pipe, 0, None, {})
@@ -214,7 +231,8 @@ class CompatibilityTests(unittest.TestCase):
     def test_lora_oom_is_not_retried_with_a_different_loader(self):
         pipe = Mock()
         pipe.load_lora_weights.side_effect = RuntimeError("out of memory")
-        with (patch.object(runtime.QwenImageTransformer2DModel, "from_single_file", return_value=Mock()),
+        with (patch.object(runtime, "hf_hub_download", return_value="config.json"),
+              patch.object(runtime.QwenImageTransformer2DModel, "from_single_file", return_value=Mock()),
               patch.object(runtime.AutoencoderKLQwenImage, "from_pretrained", return_value=Mock()),
               patch.object(runtime.QwenImageImg2ImgPipeline, "from_pretrained", return_value=pipe),
               patch("safetensors.torch.load_file", return_value={"weight": object()}) as load_weights):
@@ -222,6 +240,36 @@ class CompatibilityTests(unittest.TestCase):
                 runtime.build_pipeline(Path("model.gguf"), Path("adapter.safetensors"), "cpu", "none", "float32", .8)
             load_weights.assert_called_once_with("adapter.safetensors", device="cpu")
             pipe.load_lora_weights.assert_called_once()
+
+    def test_loading_uses_local_configs_and_matching_vae_weights(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.json"
+            config.write_text('{"_class_name":"QwenImageTransformer2DModel","num_layers":60}', encoding="utf-8")
+
+            def load_model(**kwargs):
+                loaded = runtime.QwenImageTransformer2DModel.load_config(kwargs["config"])
+                runtime.QwenImageTransformer2DModel.extract_init_dict(loaded)
+                return Mock()
+
+            def cached_file(repo_id, filename, **_kwargs):
+                if repo_id == "Qwen/Qwen-Image-2512":
+                    return str(config)
+                return str(Path(temporary) / "snapshots" / "vae-revision" / filename)
+
+            with (patch.object(runtime, "hf_hub_download", side_effect=cached_file) as download,
+                  patch.object(runtime.QwenImageTransformer2DModel, "from_single_file", side_effect=load_model),
+                  patch.object(runtime.AutoencoderKLQwenImage, "from_pretrained", return_value=Mock()) as vae,
+                  patch.object(runtime.QwenImageImg2ImgPipeline, "from_pretrained", return_value=Mock()),
+                  patch("safetensors.torch.load_file", return_value={}),
+                  self.assertNoLogs("diffusers", level="WARNING")):
+                runtime.build_pipeline(Path("model.gguf"), Path("adapter.safetensors"), "cpu", "none", "float32", .8)
+
+            download.assert_any_call(repo_id="Qwen/Qwen-Image-2512",
+                                     filename="transformer/config.json", local_files_only=True)
+            download.assert_any_call(repo_id="Qwen/Qwen-Image", filename="vae/diffusion_pytorch_model.safetensors",
+                                     revision="vae-revision", local_files_only=True)
+            vae.assert_called_once_with(str(Path(temporary) / "snapshots" / "vae-revision" / "vae"),
+                                        dtype=torch.float32, local_files_only=True)
 
     def test_cache_miss_retries_once_but_model_loading_failures_do_not(self):
         wrapper = OSError("Diffusers wrapper")
