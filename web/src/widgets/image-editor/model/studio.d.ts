@@ -1,5 +1,5 @@
-import type { AssetT, ImagePairT, MetricsT, SessionT, SettingsT } from '../../../entities/editor-session';
-import type { ViewModeT } from '../../../features/compare-images';
+import type { AssetT, ImagePairT, MetricsT, SessionT, SettingsT } from '@entities/editor-session';
+import type { ViewModeT } from '@features/compare-images';
 
 export type ProgressT = { stage: string; progress: number | null; elapsed: number };
 export type NoticeT = { id: number; message: string; error: boolean };

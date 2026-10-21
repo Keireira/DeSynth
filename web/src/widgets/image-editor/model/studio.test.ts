@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AssetT, ImagePairT, JobT, MetricsT } from '../../../entities/editor-session';
-import { defaultSettings, api } from '../../../entities/editor-session';
-import { session } from '../../../entities/editor-session/model/settings.fixtures';
+import type { AssetT, ImagePairT, JobT, MetricsT } from '@entities/editor-session';
+import { defaultSettings, api } from '@entities/editor-session';
+import { legacySession, session } from '@entities/editor-session/model/settings.fixtures';
 import { loadImage, readFile } from './image-io';
 import { createStudio } from './studio';
 
@@ -199,6 +199,62 @@ describe('studio initialization and job recovery', () => {
 		localStorage.setItem('desynth.settings.v1', JSON.stringify({ steps: 32 }));
 		const explicit = await start();
 		expect(explicit.getSnapshot().settings.steps).toBe(32);
+	});
+
+	it('restores saved model choices after moving weights and sends canonical processing paths', async () => {
+		localStorage.setItem(
+			'desynth.settings.v1',
+			JSON.stringify({
+				transformer: 'F:\\Git\\DeSynth\\ai\\Q8.gguf',
+				lightning: 'ai\\8steps.safetensors',
+				steps: 16,
+				seed: 42
+			})
+		);
+		const studio = await start();
+		expect(studio.getSnapshot().settings).toMatchObject({
+			transformer: 'inference/models/Q8.gguf',
+			lightning: 'inference/models/8steps.safetensors',
+			steps: 16,
+			seed: 42
+		});
+
+		await studio.process();
+		expect(api.process).toHaveBeenCalledWith(
+			source,
+			expect.objectContaining({
+				transformer: 'inference/models/Q8.gguf',
+				lightning: 'inference/models/8steps.safetensors',
+				steps: 16,
+				seed: 42
+			}),
+			expect.any(AbortSignal)
+		);
+	});
+
+	it('remaps committed paths after a live inventory Refresh without resetting parameters', async () => {
+		localStorage.setItem(
+			'desynth.settings.v1',
+			JSON.stringify({ transformer: 'ai/Q8.gguf', lightning: 'ai/8steps.safetensors', steps: 16, seed: 42 })
+		);
+		vi.mocked(api.session).mockResolvedValue({ ...legacySession, assets: [source], default_source_id: source.id });
+		vi.spyOn(api, 'refresh').mockResolvedValue(session);
+		const studio = await start();
+		expect(studio.getSnapshot().settings.transformer).toBe('ai/Q8.gguf');
+
+		await studio.refresh();
+		expect(studio.getSnapshot().settings).toMatchObject({
+			transformer: 'inference/models/Q8.gguf',
+			lightning: 'inference/models/8steps.safetensors',
+			steps: 16,
+			seed: 42
+		});
+		expect(JSON.parse(localStorage.getItem('desynth.settings.v1') || '{}')).toMatchObject({
+			transformer: 'inference/models/Q8.gguf',
+			lightning: 'inference/models/8steps.safetensors',
+			steps: 16,
+			seed: 42
+		});
 	});
 
 	it('reconnects the active job source and reapplies this tab restoration before export becomes ready', async () => {

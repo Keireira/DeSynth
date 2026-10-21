@@ -1,4 +1,4 @@
-import type { AssetT } from '../../../entities/editor-session';
+import type { AssetT } from '@entities/editor-session';
 import type { ViewModeT } from './view-mode.d';
 import type { DiffOptionsT } from './diff.d';
 
@@ -35,24 +35,30 @@ export const exportImage = async ({
 		if (asset && isCurrent()) {
 			download(asset.url, `${asset.name.replace(/\.[^.]+$/, '')}.png`);
 		}
+
 		return;
 	}
 	if (!diffOptions) {
 		return;
 	}
+
 	const canvas = await ensureDiff();
 	if (!canvas || !isCurrent()) {
 		return;
 	}
+
 	const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
 	if (!isCurrent()) {
 		return;
 	}
+
 	if (!blob) {
 		throw new Error('Could not export the diff.');
 	}
+
 	const url = URL.createObjectURL(blob);
 	const filename = `${diffOptions.source.name.replace(/\.[^.]+$/, '')}_diff_${diffOptions.channel}_x${diffOptions.gain}.png`;
+
 	try {
 		download(url, filename);
 	} finally {

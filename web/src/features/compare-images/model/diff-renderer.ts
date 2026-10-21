@@ -9,7 +9,9 @@ const createCanvas = (pixels: DiffPixelsT): HTMLCanvasElement => {
 	if (!context) {
 		throw new Error('Could not create the difference map.');
 	}
+
 	context.putImageData(new ImageData(new Uint8ClampedArray(pixels.buffer), pixels.width, pixels.height), 0, 0);
+
 	return canvas;
 };
 
@@ -30,6 +32,7 @@ export class DiffRenderer {
 		if (this.options?.key === options?.key) {
 			return;
 		}
+
 		this.options = options;
 		this.revision++;
 		this.canvas = null;
@@ -46,9 +49,11 @@ export class DiffRenderer {
 		if (this.canvas || !this.options) {
 			return Promise.resolve(this.canvas);
 		}
+
 		if (this.pending) {
 			return this.pending;
 		}
+
 		const revision = this.revision;
 		this.pending = this.client
 			.request(this.options)
@@ -56,7 +61,9 @@ export class DiffRenderer {
 				if (!pixels || revision !== this.revision) {
 					return null;
 				}
+
 				this.canvas = this.canvasFactory(pixels);
+
 				return this.canvas;
 			})
 			.finally(() => {
@@ -64,6 +71,7 @@ export class DiffRenderer {
 					this.pending = null;
 				}
 			});
+
 		return this.pending;
 	}
 }

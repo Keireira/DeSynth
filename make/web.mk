@@ -8,7 +8,7 @@ web-build: web-install
 	$(PNPM) build
 
 web-dev: web-install
-	$(PYTHON) scripts/web_dev.py --backend-port "$(PORT)" --port "$(WEB_PORT)" --pnpm "$(PNPM)"
+	$(NODE) scripts/web-dev.mjs --backend-port "$(PORT)" --port "$(WEB_PORT)" --pnpm "$(PNPM)"
 
 web-check: web-install
 	$(PNPM) check

@@ -1,4 +1,4 @@
-import type { AssetT } from '../../../entities/editor-session';
+import type { AssetT } from '@entities/editor-session';
 
 export type DiffChannelT = 'rgba' | 'rgb' | 'alpha';
 export type DiffOptionsT = { source: AssetT; result: AssetT; gain: number; channel: DiffChannelT; key: string };

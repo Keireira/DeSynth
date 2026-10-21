@@ -1,18 +1,38 @@
-import { record, request } from '../../../shared/api';
-import type { AssetT, DeviceT, JobT, MetricsT, ModelT, RuntimeT, SessionT, SettingsT } from '../model/editor-session.d';
+import { record, request } from '@api';
+import type {
+	AssetT,
+	DeviceT,
+	JobT,
+	MetricsT,
+	ModelT,
+	RuntimeT,
+	SessionT,
+	SettingsT
+} from '@entities/editor-session/model/editor-session.d';
 
 const text = (value: unknown): string => {
-	if (typeof value !== 'string') throw new Error('Invalid server response.');
+	if (typeof value !== 'string') {
+		throw new Error('Invalid server response.');
+	}
+
 	return value;
 };
+
 const number = (value: unknown): number => {
-	if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('Invalid server response.');
+	if (typeof value !== 'number' || !Number.isFinite(value)) {
+		throw new Error('Invalid server response.');
+	}
+
 	return value;
 };
 const nullableNumber = (value: unknown): number | null => (value == null ? null : number(value));
 const nullableText = (value: unknown): string | null => (value == null ? null : text(value));
+
 const list = <T>(value: unknown, parse: (item: unknown) => T): T[] => {
-	if (!Array.isArray(value)) throw new Error('Invalid server response.');
+	if (!Array.isArray(value)) {
+		throw new Error('Invalid server response.');
+	}
+
 	return value.map(parse);
 };
 
@@ -30,12 +50,18 @@ export const parseAsset = (value: unknown): AssetT => {
 	) {
 		throw new Error('Invalid image dimensions.');
 	}
+
 	const url = text(item.url);
-	if (url !== `/api/image/${encodeURIComponent(id)}`) throw new Error('Invalid image URL.');
+	if (url !== `/api/image/${encodeURIComponent(id)}`) {
+		throw new Error('Invalid image URL.');
+	}
+
 	return { id, name: text(item.name), width, height, url, kind: text(item.kind) };
 };
+
 const parseModel = (value: unknown): ModelT => {
 	const item = record(value);
+
 	return {
 		name: text(item.name),
 		path: text(item.path),
@@ -43,8 +69,10 @@ const parseModel = (value: unknown): ModelT => {
 		...(typeof item.steps === 'number' ? { steps: number(item.steps) } : {})
 	};
 };
+
 const parseDevice = (value: unknown): DeviceT => {
 	const item = record(value);
+
 	return {
 		id: text(item.id),
 		name: text(item.name),
@@ -53,8 +81,10 @@ const parseDevice = (value: unknown): DeviceT => {
 		offload_modes: list(item.offload_modes, text)
 	};
 };
+
 const parseRuntime = (value: unknown): RuntimeT => {
 	const item = record(value);
+
 	return {
 		ready: item.ready === true,
 		refreshing: item.refreshing === true,
@@ -63,8 +93,10 @@ const parseRuntime = (value: unknown): RuntimeT => {
 		...(typeof item.error === 'string' ? { error: item.error } : {})
 	};
 };
+
 export const parseSession = (value: unknown): SessionT => {
 	const item = record(value);
+
 	return {
 		ready: item.ready === true,
 		models: list(item.models, parseModel),
@@ -79,8 +111,10 @@ export const parseSession = (value: unknown): SessionT => {
 		runtime: parseRuntime(item.runtime)
 	};
 };
+
 export const parseMetrics = (value: unknown): MetricsT => {
 	const item = record(value);
+
 	return {
 		ssim: nullableNumber(item.ssim),
 		psnr_db: nullableNumber(item.psnr_db),
@@ -88,11 +122,14 @@ export const parseMetrics = (value: unknown): MetricsT => {
 		identical: item.identical === true
 	};
 };
+
 export const parseJob = (value: unknown): JobT => {
 	const item = record(value);
 	const status = item.status;
-	if (status !== 'queued' && status !== 'running' && status !== 'done' && status !== 'error')
+	if (status !== 'queued' && status !== 'running' && status !== 'done' && status !== 'error') {
 		throw new Error('Invalid processing status.');
+	}
+
 	return {
 		id: text(item.id),
 		source_id: text(item.source_id),
@@ -109,9 +146,13 @@ export const parseJob = (value: unknown): JobT => {
 };
 
 type RestoreT = { superseded: true } | { superseded: false; result: AssetT; metrics: MetricsT };
+
 const parseRestoration = (value: unknown): RestoreT => {
 	const item = record(value);
-	if (item.superseded === true) return { superseded: true };
+	if (item.superseded === true) {
+		return { superseded: true };
+	}
+
 	return { superseded: false, result: parseAsset(item.result), metrics: parseMetrics(item.metrics) };
 };
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ImagePairT } from '../../../entities/editor-session';
+import type { ImagePairT } from '@entities/editor-session';
 import type { ViewModeT } from './view-mode.d';
 import type { DividerT, SizeT, ViewT } from './geometry.d';
 import { drawComparison } from './draw-comparison';
@@ -23,18 +23,21 @@ export const useImageCanvas = ({ source, result, mode, view, diff }: ImageCanvas
 		if (!viewport) {
 			return;
 		}
+
 		const updateSize = () => {
 			const { clientWidth: width, clientHeight: height } = viewport;
 			setSize((previous) => {
 				if (previous.width === width && previous.height === height) {
 					return previous;
 				}
+
 				return { width, height };
 			});
 		};
 		const observer = new ResizeObserver(updateSize);
 		observer.observe(viewport);
 		updateSize();
+
 		return () => {
 			observer.disconnect();
 		};
@@ -46,6 +49,7 @@ export const useImageCanvas = ({ source, result, mode, view, diff }: ImageCanvas
 				drawComparison({ canvas: canvasRef.current, size, source, result, mode, view, diff });
 			}
 		});
+
 		return () => {
 			cancelAnimationFrame(frame);
 		};
@@ -69,5 +73,6 @@ export const useImageCanvas = ({ source, result, mode, view, diff }: ImageCanvas
 			divider.visible = divider.x >= 0 && divider.x <= size.width && divider.height > 0;
 		}
 	}
+
 	return { viewportRef, canvasRef, rect, divider, zoomPercent };
 };

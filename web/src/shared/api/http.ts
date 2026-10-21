@@ -8,9 +8,13 @@ export class ApiError extends Error {
 }
 
 export const record = (value: unknown): Record<string, unknown> => {
-	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid server response.');
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new Error('Invalid server response.');
+	}
+
 	return Object.fromEntries(Object.entries(value));
 };
+
 export const request = async <T>(
 	path: string,
 	parse: (value: unknown) => T,
@@ -24,6 +28,7 @@ export const request = async <T>(
 			: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })
 	});
 	let value: unknown;
+
 	try {
 		value = await response.json();
 	} catch {
@@ -36,6 +41,7 @@ export const request = async <T>(
 			response.status
 		);
 	}
+
 	return parse(value);
 };
 

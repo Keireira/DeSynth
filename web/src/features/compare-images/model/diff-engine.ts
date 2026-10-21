@@ -1,4 +1,4 @@
-import type { AssetT } from '../../../entities/editor-session';
+import type { AssetT } from '@entities/editor-session';
 import type { DiffOptionsT, PixelLoaderT } from './diff.d';
 
 export const MAX_CACHE_BYTES = 288 * 1024 * 1024;
@@ -14,6 +14,7 @@ const fetchPixels: PixelLoaderT = async (asset) => {
 	if (!response.ok) {
 		throw new Error('Could not read RGBA pixel data.');
 	}
+
 	return new Uint8Array(await response.arrayBuffer());
 };
 
@@ -51,6 +52,7 @@ export class PixelCache {
 		if (cached && cached.width === asset.width && cached.height === asset.height) {
 			this.entries.delete(asset.id);
 			this.entries.set(asset.id, cached);
+
 			return cached.pixels;
 		}
 		this.remove(asset.id);
@@ -58,9 +60,11 @@ export class PixelCache {
 		if (pixels.length !== asset.width * asset.height * 4) {
 			throw new Error('Incomplete RGBA pixel data.');
 		}
+
 		if (!this.retainedIds.has(asset.id) || pixels.byteLength > this.maxBytes) {
 			return pixels;
 		}
+
 		while (this.entries.size >= MAX_CACHE_ENTRIES || this.bytes + pixels.byteLength > this.maxBytes) {
 			const oldestId = this.entries.keys().next().value;
 			if (oldestId === undefined) {
@@ -70,6 +74,7 @@ export class PixelCache {
 		}
 		this.entries.set(asset.id, { pixels, width: asset.width, height: asset.height });
 		this.bytes += pixels.byteLength;
+
 		return pixels;
 	}
 }
@@ -92,17 +97,21 @@ export const calculateDiff = async (
 	if (!validSize || source.width !== result.width || source.height !== result.height) {
 		throw new Error('Diff images must have the same valid dimensions.');
 	}
+
 	if (!Number.isFinite(gain) || gain < 0 || gain > 255 || !['rgba', 'rgb', 'alpha'].includes(channel)) {
 		throw new Error('Invalid diff settings.');
 	}
+
 	const original = await cache.read(source);
 	if (!isCurrent()) {
 		return null;
 	}
+
 	const output = await cache.read(result);
 	if (!isCurrent()) {
 		return null;
 	}
+
 	const pixels = new Uint8ClampedArray(original.length);
 	for (let start = 0; start < original.length; start += PIXELS_PER_CHUNK * 4) {
 		const end = Math.min(original.length, start + PIXELS_PER_CHUNK * 4);
@@ -126,5 +135,6 @@ export const calculateDiff = async (
 			}
 		}
 	}
+
 	return pixels;
 };

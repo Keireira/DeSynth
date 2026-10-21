@@ -1,5 +1,5 @@
-import type { AssetT, JobT, MetricsT, SessionT, SettingsT } from '../../../entities/editor-session';
-import type { ViewModeT } from '../../../features/compare-images';
+import type { AssetT, JobT, MetricsT, SessionT, SettingsT } from '@entities/editor-session';
+import type { ViewModeT } from '@features/compare-images';
 import {
 	configurationProblem,
 	defaultSettings,
@@ -8,8 +8,8 @@ import {
 	persistSettings,
 	readSettings,
 	api
-} from '../../../entities/editor-session';
-import { ApiError, errorMessage, isAbort } from '../../../shared/api';
+} from '@entities/editor-session';
+import { ApiError, errorMessage, isAbort } from '@api';
 import { loadImage, readFile, readSelection, saveSelection } from './image-io';
 import { delay, watchJob } from './jobs';
 import { createRestoration } from './restoration';
@@ -40,29 +40,46 @@ export const createStudio = () => {
 	let generation = 0;
 	let resultVersion = 0;
 	let noticeId = 0;
+
 	const update = (patch: Partial<StudioStateT>) => {
 		state = { ...state, ...patch };
-		for (const listener of listeners) listener();
+		for (const listener of listeners) {
+			listener();
+		}
 	};
 	const notify = (message: string, error = false) => update({ notice: { id: ++noticeId, message, error } });
+
 	const report = (error: unknown) => {
-		if (!isAbort(error)) notify(errorMessage(error), true);
+		if (!isAbort(error)) {
+			notify(errorMessage(error), true);
+		}
 	};
+
 	const remember = () => {
-		if (state.source) saveSelection(state.source.asset, state.result?.asset ?? null, state.clean);
+		if (state.source) {
+			saveSelection(state.source.asset, state.result?.asset ?? null, state.clean);
+		}
 	};
+
 	const compare = async (signal: AbortSignal) => {
 		const source = state.source?.asset;
 		const result = state.result?.asset;
-		if (!source || !result) return;
+		if (!source || !result) {
+			return;
+		}
+
 		try {
 			const metrics = await api.compare(source, result, signal);
-			if (!signal.aborted && source.id === state.source?.asset.id && result.id === state.result?.asset.id)
+			if (!signal.aborted && source.id === state.source?.asset.id && result.id === state.result?.asset.id) {
 				update({ metrics });
+			}
 		} catch (error) {
-			if (!signal.aborted && result.id === state.result?.asset.id) report(error);
+			if (!signal.aborted && result.id === state.result?.asset.id) {
+				report(error);
+			}
 		}
 	};
+
 	const assignResult = async (
 		asset: AssetT,
 		metrics: MetricsT | null,
@@ -71,30 +88,43 @@ export const createStudio = () => {
 		signal: AbortSignal
 	) => {
 		const source = state.source?.asset;
-		if (!source || source.width !== asset.width || source.height !== asset.height)
+		if (!source || source.width !== asset.width || source.height !== asset.height) {
 			throw new Error('Result dimensions do not match the original.');
+		}
+
 		const version = ++resultVersion;
 		const image = await loadImage(asset, signal);
-		if (signal.aborted || !current() || source.id !== state.source?.asset.id || version !== resultVersion) return;
+		if (signal.aborted || !current() || source.id !== state.source?.asset.id || version !== resultVersion) {
+			return;
+		}
+
 		update({ result: image, clean, metrics });
 		remember();
-		if (!metrics) void compare(signal);
+		if (!metrics) {
+			void compare(signal);
+		}
 	};
 	const restoration = createRestoration({
 		onBusy: (restoring) => update({ restoring, exportRevision: state.exportRevision + 1 }),
 		onResult: (asset, metrics, clean, current, signal) => assignResult(asset, metrics, clean, current, signal),
 		onError: report
 	});
+
 	const scheduleRestore = () => {
 		resultVersion++;
 		if (state.source && state.clean && !state.processing && !state.uploading) {
 			restoration.schedule(state.source.asset, state.clean, state.settings);
-		} else restoration.cancel();
+		} else {
+			restoration.cancel();
+		}
 	};
+
 	const validatedSettings = () => {
 		const seed = state.seed.trim() === '' ? null : Number(state.seed);
+
 		return normalizeSettings({ ...state.settings, seed });
 	};
+
 	const saveLive = () => {
 		try {
 			persistSettings(validatedSettings());
@@ -102,6 +132,7 @@ export const createStudio = () => {
 			/* Partial seed input stays editable; explicit Save reports storage errors. */
 		}
 	};
+
 	const changeSettings = (patch: Partial<SettingsT>) => {
 		const previous = state.settings;
 		const settings = normalizeSettings({ ...previous, ...patch });
@@ -112,39 +143,73 @@ export const createStudio = () => {
 			previous.restore_sigma !== settings.restore_sigma ||
 			previous.restore_mode !== settings.restore_mode ||
 			previous.unsharp !== settings.unsharp
-		)
+		) {
 			scheduleRestore();
+		}
 	};
+
 	const applySettings = (settings: SettingsT) => {
 		update({ seed: settings.seed == null ? '' : String(settings.seed) });
 		changeSettings(settings);
 	};
+
+	const updateInventory = (session: SessionT) => {
+		const previous = state.settings;
+		const settings = migrateModelPaths(previous, session);
+		update({ session, settings });
+
+		if (previous.transformer !== settings.transformer || previous.lightning !== settings.lightning) {
+			saveLive();
+		}
+	};
+
 	const pollInventory = async (initial: SessionT, signal: AbortSignal) => {
 		let session = initial;
 		for (let attempts = 0; !session.runtime.ready || session.runtime.refreshing; attempts++) {
-			if (attempts >= 120) throw new Error('Device refresh timed out. Click Refresh to try again.');
+			if (attempts >= 120) {
+				throw new Error('Device refresh timed out. Click Refresh to try again.');
+			}
+
 			await delay(500, signal);
 			session = await api.session(signal);
-			if (signal.aborted) return;
-			update({ session });
+			if (signal.aborted) {
+				return;
+			}
+
+			updateInventory(session);
 		}
-		if (session.runtime.error) throw new Error(`Device detection failed: ${session.runtime.error}`);
+		if (session.runtime.error) {
+			throw new Error(`Device detection failed: ${session.runtime.error}`);
+		}
 	};
+
 	const refresh = async () => {
-		if (!life || state.processing || state.refreshing) return;
+		if (!life || state.processing || state.refreshing) {
+			return;
+		}
+
 		const signal = life.signal;
 		update({ refreshing: true });
+
 		try {
 			const session = await api.refresh(signal);
-			if (signal.aborted) return;
-			update({ session });
+			if (signal.aborted) {
+				return;
+			}
+
+			updateInventory(session);
 			await pollInventory(session, signal);
 		} catch (error) {
-			if (!signal.aborted) throw error;
+			if (!signal.aborted) {
+				throw error;
+			}
 		} finally {
-			if (!signal.aborted) update({ refreshing: false });
+			if (!signal.aborted) {
+				update({ refreshing: false });
+			}
 		}
 	};
+
 	const followJob = async (id: string, signal: AbortSignal) => {
 		const token = generation;
 		const job = await watchJob(
@@ -168,14 +233,25 @@ export const createStudio = () => {
 			}
 		}
 	};
+
 	const process = async () => {
-		if (!life || !state.source || state.processing || state.uploading || state.refreshing || state.initializing) return;
+		if (!life || !state.source || state.processing || state.uploading || state.refreshing || state.initializing) {
+			return;
+		}
+
 		const signal = life.signal;
+
 		try {
 			const params = validatedSettings();
 			const problem = configurationProblem(params, state.session);
-			if (problem) throw new Error(problem);
-			if (!state.session?.ready) throw new Error('Run make setup to enable processing.');
+			if (problem) {
+				throw new Error(problem);
+			}
+
+			if (!state.session?.ready) {
+				throw new Error('Run make setup to enable processing.');
+			}
+
 			restoration.cancel();
 			resultVersion++;
 			update({
@@ -185,15 +261,24 @@ export const createStudio = () => {
 			const job = await api.process(state.source.asset, params, signal);
 			await followJob(job.id, signal);
 		} catch (error) {
-			if (!signal.aborted) report(error);
+			if (!signal.aborted) {
+				report(error);
+			}
 		} finally {
-			if (!signal.aborted) update({ processing: false, progress: null });
+			if (!signal.aborted) {
+				update({ processing: false, progress: null });
+			}
 		}
 	};
+
 	const upload = async (file: File) => {
-		if (!life || state.processing || state.initializing) return;
+		if (!life || state.processing || state.initializing) {
+			return;
+		}
+
 		if (file.size > 32 * 1024 * 1024) {
 			notify('Maximum file size: 32 MB.', true);
+
 			return;
 		}
 		uploadTask?.abort();
@@ -203,17 +288,29 @@ export const createStudio = () => {
 		restoration.cancel();
 		resultVersion++;
 		update({ uploading: true, exportRevision: state.exportRevision + 1 });
+
 		try {
 			const data = await readFile(file, task.signal);
-			if (task.signal.aborted || token !== generation) return;
+			if (task.signal.aborted || token !== generation) {
+				return;
+			}
+
 			const asset = await api.upload(file.name, data, task.signal);
-			if (task.signal.aborted || token !== generation) return;
+			if (task.signal.aborted || token !== generation) {
+				return;
+			}
+
 			const image = await loadImage(asset, task.signal);
-			if (task.signal.aborted || token !== generation) return;
+			if (task.signal.aborted || token !== generation) {
+				return;
+			}
+
 			update({ source: image, result: null, clean: null, metrics: null, mode: 'original' });
 			remember();
 		} catch (error) {
-			if (token === generation) report(error);
+			if (token === generation) {
+				report(error);
+			}
 		} finally {
 			if (token === generation && !task.signal.aborted) {
 				uploadTask = null;
@@ -221,17 +318,22 @@ export const createStudio = () => {
 			}
 		}
 	};
+
 	const connect = async (signal: AbortSignal): Promise<SessionT> => {
 		while (!signal.aborted) {
 			try {
 				return await api.session(signal);
 			} catch (error) {
-				if (signal.aborted || error instanceof ApiError) throw error;
+				if (signal.aborted || error instanceof ApiError) {
+					throw error;
+				}
+
 				await delay(1000, signal);
 			}
 		}
 		throw new DOMException('Cancelled.', 'AbortError');
 	};
+
 	const initializeImages = async (session: SessionT, signal: AbortSignal) => {
 		const selection = readSelection();
 		const active: JobT | null = session.active_job_id ? await api.job(session.active_job_id, signal) : null;
@@ -239,9 +341,15 @@ export const createStudio = () => {
 		const source =
 			session.assets.find((asset) => asset.id === selectedSource) ||
 			session.assets.find((asset) => asset.id === session.default_source_id);
-		if (!source) return active;
+		if (!source) {
+			return active;
+		}
+
 		const image = await loadImage(source, signal);
-		if (signal.aborted) return null;
+		if (signal.aborted) {
+			return null;
+		}
+
 		update({ source: image });
 		const result =
 			session.assets.find((asset) => asset.id === selection.result) ||
@@ -256,20 +364,30 @@ export const createStudio = () => {
 				scheduleRestore();
 			}
 		}
+
 		return active;
 	};
+
 	const start = () => {
 		const task = new AbortController();
 		life = task;
 		update({ initializing: true, processing: false, uploading: false, refreshing: false, progress: null });
+
 		const reportStartup = (error: unknown) => {
-			if (!task.signal.aborted) report(error);
+			if (!task.signal.aborted) {
+				report(error);
+			}
 		};
+
 		const run = async () => {
 			try {
 				const session = await connect(task.signal);
-				if (task.signal.aborted) return;
+				if (task.signal.aborted) {
+					return;
+				}
+
 				let settings: SettingsT;
+
 				try {
 					settings = readSettings(session.default_steps);
 				} catch {
@@ -278,12 +396,18 @@ export const createStudio = () => {
 				}
 				settings = migrateModelPaths(settings, session);
 				update({ session, settings, seed: settings.seed == null ? '' : String(settings.seed) });
-				if (!session.runtime.ready || session.runtime.refreshing)
+				if (!session.runtime.ready || session.runtime.refreshing) {
 					void pollInventory(session, task.signal).catch(reportStartup);
+				}
 				const active = await initializeImages(session, task.signal);
-				if (task.signal.aborted) return;
+				if (task.signal.aborted) {
+					return;
+				}
+
 				update({ initializing: false });
-				if (!session.ready) notify('Run make setup to enable processing. Image comparison is available.');
+				if (!session.ready) {
+					notify('Run make setup to enable processing. Image comparison is available.');
+				}
 				if (active) {
 					update({ processing: true });
 					await followJob(active.id, task.signal);
@@ -295,23 +419,30 @@ export const createStudio = () => {
 			} catch (error) {
 				reportStartup(error);
 			} finally {
-				if (!task.signal.aborted) update({ initializing: false, processing: false, progress: null });
+				if (!task.signal.aborted) {
+					update({ initializing: false, processing: false, progress: null });
+				}
 			}
 		};
 		void run();
+
 		return () => {
 			task.abort();
 			uploadTask?.abort();
 			restoration.cancel();
 			generation++;
 			resultVersion++;
-			if (life === task) life = null;
+			if (life === task) {
+				life = null;
+			}
 		};
 	};
+
 	return {
 		getSnapshot: () => state,
 		subscribe: (listener: () => void) => {
 			listeners.add(listener);
+
 			return () => {
 				listeners.delete(listener);
 			};

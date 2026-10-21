@@ -3,6 +3,7 @@
 node_modules/
 .pnpm-store/
 dist/
+target/
 .rspack-profile-*/
 *.tsbuildinfo
 /web/*.local
@@ -27,6 +28,8 @@ __pycache__/
 # Large downloaded model weights.
 *.gguf
 *.safetensors
+/inference/models/.*.part
+/inference/models/.*.part.json
 
 # Keep reference results from original.png; ignore other outputs and caches.
 /out/*

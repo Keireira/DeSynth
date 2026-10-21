@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ImagePairT } from '../../../entities/editor-session';
+import type { ImagePairT } from '@entities/editor-session';
 import type { ViewModeT } from './view-mode.d';
 import type { DiffMessageT, DiffResponseT, DiffWorkerT } from './diff.d';
 import { exportImage } from './export-image';

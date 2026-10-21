@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { JobT } from '../../../entities/editor-session';
-import { api } from '../../../entities/editor-session';
-import { ApiError } from '../../../shared/api';
+import type { JobT } from '@entities/editor-session';
+import { api } from '@entities/editor-session';
+import { ApiError } from '@api';
 import { delay, watchJob } from './jobs';
 
 beforeEach(() => {

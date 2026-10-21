@@ -14,6 +14,23 @@
     "verbatimModuleSyntax": true,
     "resolveJsonModule": true,
     "allowImportingTsExtensions": true,
+    "paths": {
+      "@/*": ["./*"],
+      "@src/*": ["./src/*"],
+      "@app": ["./src/app"],
+      "@app/*": ["./src/app/*"],
+      "@entities/*": ["./src/entities/*"],
+      "@features/*": ["./src/features/*"],
+      "@widgets/*": ["./src/widgets/*"],
+      "@pages/*": ["./src/pages/*"],
+      "@shared/*": ["./src/shared/*"],
+      "@ui": ["./src/shared/ui"],
+      "@ui/*": ["./src/shared/ui/*"],
+      "@lib": ["./src/shared/lib"],
+      "@lib/*": ["./src/shared/lib/*"],
+      "@api": ["./src/shared/api"],
+      "@api/*": ["./src/shared/api/*"]
+    },
 
     /* type checking */
     "strict": true,

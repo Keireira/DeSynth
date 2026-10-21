@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { AssetT } from '../../../entities/editor-session';
+import type { AssetT } from '@entities/editor-session';
 import type { DiffOptionsT, DiffPixelsT, DiffWorkerT } from './diff.d';
 import { DiffClient } from './diff-client';
 import { calculateDiff, PixelCache } from './diff-engine';

@@ -1,5 +1,5 @@
 import GlobalStyle from './styles/global.styles';
-import EditorPage from '../pages/editor';
+import EditorPage from '@pages/editor';
 
 const App = () => (
 	<>

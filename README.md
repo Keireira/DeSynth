@@ -33,7 +33,7 @@ the original dimensions and alpha channel.
 
 ### Setup
 
-Install **Python 3.11**, **Node.js 24 LTS**, **pnpm** and **GNU Make**, then run
+Install **Rust 1.94+**, **Python 3.11**, **Node.js 24 LTS**, **pnpm** and **GNU Make**, then run
 from the repository folder:
 
 ```sh
@@ -41,9 +41,11 @@ make setup
 make gui
 ```
 
-Setup installs dependencies and downloads models into `ai/`. The default is
-**Q4_K_M**, the smaller model. Keep the included `embeds_cache.pt`.
+Setup installs dependencies and downloads models into `inference/models/`. The default is
+**Q4_K_M**, the smaller model. Keep the included `inference/models/embeds_cache.pt`.
 The editor is built from `web/`; `make gui` rebuilds it before starting.
+The backend and CLI run on Rust. The Python worker, its dependencies and tests
+live in `inference/`; comparison, RGBA diff and detail restoration run without Python.
 
 For CPU-only installation, use `make setup BACKEND=cpu`.
 Use `make doctor` to check setup and `make help` to list commands.
@@ -52,7 +54,7 @@ Use `make doctor` to check setup and `make help` to list commands.
 
 One GGUF model and one Lightning adapter are required:
 
-| File in `ai/` | Size | Use |
+| File in `inference/models/` | Size | Use |
 |---|---:|---|
 | `Qwen-Image-2512-Q4_K_M.gguf` | ~13 GB | Default model |
 | `Qwen-Image-2512-Q8_0.gguf` | ~21.8 GB | Optional, more memory required |
@@ -98,10 +100,13 @@ make web-dev
 
 `make web-check` runs TypeScript, lint, formatting checks and frontend tests.
 `make web-format` applies the shared root formatting rules.
+`make backend-check` checks Rust; `make inference-check` tests the model worker.
 
 The frontend follows [Feature-Sliced Design](https://habr.com/ru/companies/inDrive/articles/693768/):
 `app → pages → widgets → features → entities → shared`. Slices expose public
-`index.ts` APIs and import lower layers. `make web-check` also checks these
+`index.ts` APIs and import lower layers through aliases from `web/tsconfig.json`.
+Components have their own `index.ts`
+and `[component-name].d.ts` for types. `make web-check` also checks these
 boundaries and circular imports.
 
 ### CLI
@@ -116,7 +121,7 @@ make run ARGS="--seed 42"
 make run ARGS="--seed 42 --restore-mode edge"
 
 # Select Q8 explicitly
-make run ARGS="--transformer ai/Qwen-Image-2512-Q8_0.gguf --seed 42"
+make run ARGS="--transformer inference/models/Qwen-Image-2512-Q8_0.gguf --seed 42"
 ```
 
 For `original.png`, final images and `comparison_...` PNGs go to `out/` with

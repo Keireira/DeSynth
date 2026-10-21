@@ -1,8 +1,0 @@
---index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
-# CPU builds on Windows/Linux; PyPI supplies macOS wheels with MPS support.
-torch==2.7.1+cpu; sys_platform != "darwin"
-torchvision==0.22.1+cpu; sys_platform != "darwin"
-torch==2.7.1; sys_platform == "darwin"
-torchvision==0.22.1; sys_platform == "darwin"
--r requirements-common.txt

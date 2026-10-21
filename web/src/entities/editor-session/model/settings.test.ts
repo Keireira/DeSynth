@@ -61,16 +61,40 @@ describe('settings boundary', () => {
 		expect(() => readSettings()).toThrow(/Could not read saved settings/);
 	});
 
-	it('migrates bare model filenames but keeps unavailable explicit paths', () => {
-		const settings = normalizeSettings({ transformer: 'Q8.gguf', lightning: 'ai\\missing.safetensors' });
+	it.each([
+		'Q8.gguf',
+		'ai/Q8.gguf',
+		'ai\\Q8.gguf',
+		'./ai/Q8.gguf',
+		'F:\\Git\\DeSynth\\ai\\Q8.gguf',
+		'F:/Git/DeSynth/ai/Q8.gguf',
+		'/home/user/DeSynth/ai/Q8.gguf',
+		'//server/share/DeSynth/ai/Q8.gguf',
+		'ai/q8.GGUF'
+	])('migrates the moved model path %s without changing its settings', (transformer) => {
+		const settings = normalizeSettings({ transformer, lightning: 'ai\\8steps.safetensors', steps: 16, seed: 42 });
 		expect(migrateModelPaths(settings, session)).toMatchObject({
-			transformer: 'ai/Q8.gguf',
-			lightning: 'ai/missing.safetensors'
+			transformer: 'inference/models/Q8.gguf',
+			lightning: 'inference/models/8steps.safetensors',
+			steps: 16,
+			seed: 42
 		});
-		expect(settings.transformer).toBe('Q8.gguf');
-		expect(migrateModelPaths(normalizeSettings({ transformer: 'old/Q8.gguf' }), session).transformer).toBe(
-			'old/Q8.gguf'
+		expect(settings.transformer).toBe(transformer.replaceAll('\\', '/'));
+	});
+
+	it('preserves available explicit selections and unavailable or ambiguous model paths', () => {
+		const available = { ...session, models: [...session.models, { path: 'ai/Q8.gguf', name: 'Q8.gguf' }] };
+		expect(migrateModelPaths(normalizeSettings({ transformer: 'ai/Q8.gguf' }), available).transformer).toBe(
+			'ai/Q8.gguf'
 		);
+		expect(migrateModelPaths(normalizeSettings({ transformer: 'Q8.gguf' }), available).transformer).toBe('Q8.gguf');
+
+		for (const transformer of ['old/Q8.gguf', 'ai/missing.gguf', '/previous/models/Q8.gguf']) {
+			const migrated = migrateModelPaths(normalizeSettings({ transformer }), session);
+			expect(migrated.transformer).toBe(transformer);
+			expect(configurationProblem(migrated, session)).toMatch(/model is unavailable/);
+		}
+		expect(migrateModelPaths(defaultSettings, session)).toEqual(defaultSettings);
 	});
 
 	it('blocks unavailable weights, devices and incompatible runtime choices', () => {
@@ -89,7 +113,9 @@ describe('settings boundary', () => {
 		expect(configurationProblem({ ...defaultSettings, device: 'cpu', precision: 'bfloat16' }, session)).toMatch(
 			/precision/
 		);
-		expect(configurationProblem(defaultSettings, { ...session, models: [] })).toMatch(/No model found/);
+		expect(configurationProblem(defaultSettings, { ...session, models: [] })).toBe(
+			'No model found. Add weights to inference/models/ and click Refresh.'
+		);
 	});
 });
 

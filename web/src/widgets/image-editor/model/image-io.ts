@@ -1,13 +1,15 @@
-import type { AssetT, ImagePairT } from '../../../entities/editor-session';
+import type { AssetT, ImagePairT } from '@entities/editor-session';
 
 export const loadImage = (asset: AssetT, signal: AbortSignal): Promise<ImagePairT> =>
 	new Promise((resolve, reject) => {
 		const image = new Image();
+
 		const clean = () => {
 			image.onload = null;
 			image.onerror = null;
 			signal.removeEventListener('abort', handleAbort);
 		};
+
 		const handleAbort = () => {
 			clean();
 			image.src = '';
@@ -15,6 +17,7 @@ export const loadImage = (asset: AssetT, signal: AbortSignal): Promise<ImagePair
 		};
 		if (signal.aborted) {
 			handleAbort();
+
 			return;
 		}
 		signal.addEventListener('abort', handleAbort, { once: true });
@@ -33,6 +36,7 @@ export const readFile = (file: File, signal: AbortSignal): Promise<string> =>
 	new Promise((resolve, reject) => {
 		const reader = new FileReader();
 		const clean = () => signal.removeEventListener('abort', handleAbort);
+
 		const handleAbort = () => {
 			reader.abort();
 			clean();
@@ -40,13 +44,17 @@ export const readFile = (file: File, signal: AbortSignal): Promise<string> =>
 		};
 		if (signal.aborted) {
 			handleAbort();
+
 			return;
 		}
 		signal.addEventListener('abort', handleAbort, { once: true });
 		reader.onload = () => {
 			clean();
-			if (typeof reader.result === 'string') resolve(reader.result);
-			else reject(new Error('Could not read the file.'));
+			if (typeof reader.result === 'string') {
+				resolve(reader.result);
+			} else {
+				reject(new Error('Could not read the file.'));
+			}
 		};
 		reader.onerror = () => {
 			clean();
@@ -56,6 +64,7 @@ export const readFile = (file: File, signal: AbortSignal): Promise<string> =>
 	});
 
 type SelectionT = { source: string | null; result: string | null; clean: string | null };
+
 export const readSelection = (): SelectionT => {
 	try {
 		const raw: unknown = JSON.parse(localStorage.getItem('desynth.selection.v1') || '{}');
@@ -69,8 +78,10 @@ export const readSelection = (): SelectionT => {
 	} catch {
 		/* A missing selection falls back to the project images. */
 	}
+
 	return { source: null, result: null, clean: null };
 };
+
 export const saveSelection = (source: AssetT, result: AssetT | null, clean: AssetT | null): void => {
 	try {
 		localStorage.setItem(

@@ -1,17 +1,12 @@
 import { useEffect, useRef, useState, type ChangeEvent } from 'react';
-import {
-	deletePreset,
-	readPresets,
-	savePreset,
-	migrateModelPaths,
-	normalizeSettings
-} from '../../../entities/editor-session';
-import type { PresetT } from '../../../entities/editor-session';
+import { deletePreset, readPresets, savePreset, migrateModelPaths, normalizeSettings } from '@entities/editor-session';
+import type { PresetT } from '@entities/editor-session';
 import type { UsePresetsOptionsT } from './use-presets.d';
 
 const initialPresets = (): { presets: PresetT[]; error: string } => {
 	try {
 		const saved = readPresets();
+
 		return { presets: saved.presets, error: saved.skippedInvalid ? 'Skipped invalid saved presets.' : '' };
 	} catch (error) {
 		return { presets: [], error: error instanceof Error ? error.message : 'Could not read saved presets.' };
@@ -38,17 +33,21 @@ export const usePresets = ({ value, session, disabled, onChange, onError }: UseP
 		if (!selected) {
 			return;
 		}
+
 		const params = session ? migrateModelPaths(selected.params, session) : normalizeSettings(selected.params);
 		setName(selected.name);
 		onChange(params);
 	};
+
 	const handleName = (event: ChangeEvent<HTMLInputElement>) => {
 		setName(event.currentTarget.value);
 	};
+
 	const handleSave = () => {
 		if (disabled) {
 			return;
 		}
+
 		try {
 			const saved = savePreset(presets, name, value);
 			setPresets(saved.presets);
@@ -59,10 +58,12 @@ export const usePresets = ({ value, session, disabled, onChange, onError }: UseP
 			onError(error instanceof Error ? error.message : 'Could not save preset.', true);
 		}
 	};
+
 	const handleDelete = () => {
 		if (disabled || !presets.some((item) => item.id === selectedId)) {
 			return;
 		}
+
 		try {
 			const saved = deletePreset(presets, selectedId);
 			setPresets(saved);

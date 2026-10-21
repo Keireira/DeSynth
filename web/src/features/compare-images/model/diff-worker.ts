@@ -14,6 +14,7 @@ const send = (message: DiffResponseT, transfer: Transferable[] = []) => {
 const takePending = (): JobT | null => {
 	const job = pending;
 	pending = null;
+
 	return job;
 };
 
@@ -21,12 +22,15 @@ const pump = async () => {
 	if (running) {
 		return;
 	}
+
 	running = true;
+
 	try {
 		let job = takePending();
 		while (job) {
 			const currentJob = job;
 			const isCurrent = () => currentJob.revision === revision;
+
 			try {
 				const pixels = await calculateDiff(currentJob, cache, isCurrent);
 				if (pixels && isCurrent()) {
@@ -66,6 +70,7 @@ self.onmessage = ({ data }: MessageEvent<DiffMessageT>) => {
 	}
 	if (data.type === 'invalidate') {
 		cache.retain(data.retain);
+
 		return;
 	}
 	cache.retain([data.source.id, data.result.id]);

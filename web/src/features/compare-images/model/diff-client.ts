@@ -19,6 +19,7 @@ export class DiffClient {
 		if (!request) {
 			return;
 		}
+
 		this.requests.delete(data.id);
 		if ('error' in data) {
 			request.reject(new Error(data.error));
@@ -54,8 +55,10 @@ export class DiffClient {
 		if (this.error) {
 			return Promise.reject(this.error);
 		}
+
 		this.cancelRequests();
 		const id = ++this.requestId;
+
 		return new Promise((resolve, reject) => {
 			this.requests.set(id, { resolve, reject });
 			this.worker.postMessage({ type: 'diff', id, ...options });

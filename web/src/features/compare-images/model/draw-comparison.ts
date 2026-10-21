@@ -1,4 +1,4 @@
-import type { ImagePairT } from '../../../entities/editor-session';
+import type { ImagePairT } from '@entities/editor-session';
 import type { ViewModeT } from './view-mode.d';
 import type { AreaT, ImageRectT, SizeT, ViewT } from './geometry.d';
 import { imageRect } from './geometry';
@@ -14,6 +14,7 @@ type DrawOptionsT = {
 };
 
 let checkerboard: HTMLCanvasElement | null = null;
+
 const checkerboardPattern = (context: CanvasRenderingContext2D) => {
 	if (!checkerboard) {
 		checkerboard = document.createElement('canvas');
@@ -27,6 +28,7 @@ const checkerboardPattern = (context: CanvasRenderingContext2D) => {
 			tile.fillRect(8, 8, 8, 8);
 		}
 	}
+
 	return context.createPattern(checkerboard, 'repeat') ?? '#282828';
 };
 
@@ -50,6 +52,7 @@ export const drawComparison = ({ canvas, size, source, result, mode, view, diff 
 	if (!width || !height) {
 		return;
 	}
+
 	const dpr = Math.min(window.devicePixelRatio || 1, 2);
 	const pixelWidth = Math.round(width * dpr);
 	const pixelHeight = Math.round(height * dpr);
@@ -61,11 +64,13 @@ export const drawComparison = ({ canvas, size, source, result, mode, view, diff 
 	if (!context) {
 		return;
 	}
+
 	context.setTransform(dpr, 0, 0, dpr, 0, 0);
 	context.clearRect(0, 0, width, height);
 	if (!source) {
 		return;
 	}
+
 	const rect = imageRect(source.asset, { x: 0, y: 0, width, height }, view);
 	if (mode === 'side' && result) {
 		const half = (width - 12) / 2;
@@ -73,6 +78,7 @@ export const drawComparison = ({ canvas, size, source, result, mode, view, diff 
 		const right = imageRect(result.asset, { x: half + 12, y: 0, width: half, height }, view);
 		drawClipped(context, source.image, left, { x: 0, y: 0, width: width / 2, height });
 		drawClipped(context, result.image, right, { x: width / 2, y: 0, width: width / 2, height });
+
 		return;
 	}
 	if (mode === 'split' && result) {
@@ -89,16 +95,19 @@ export const drawComparison = ({ canvas, size, source, result, mode, view, diff 
 			width: rect.width * view.split,
 			height: rect.height
 		});
+
 		return;
 	}
 	if (mode === 'diff' && result) {
 		if (diff) {
 			drawAsset(context, diff, rect);
 		}
+
 		return;
 	}
 	if (mode === 'result' && result) {
 		drawAsset(context, result.image, rect);
+
 		return;
 	}
 	drawAsset(context, source.image, rect);

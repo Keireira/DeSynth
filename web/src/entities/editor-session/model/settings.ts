@@ -36,6 +36,7 @@ const readNumber = (
 	) {
 		throw new Error(`Invalid ${key.replaceAll('_', ' ')}.`);
 	}
+
 	return number;
 };
 
@@ -44,6 +45,7 @@ const readBoolean = (value: Record<string, unknown>, key: 'restore' | 'keep_inte
 	if (typeof enabled !== 'boolean') {
 		throw new Error('Invalid restoration settings.');
 	}
+
 	return enabled;
 };
 
@@ -51,6 +53,7 @@ const readModelPath = (value: unknown) => {
 	if (value != null && typeof value !== 'string') {
 		throw new Error('Invalid model path.');
 	}
+
 	return value ? value.replaceAll('\\', '/') : null;
 };
 
@@ -58,24 +61,29 @@ export const normalizeSettings = (value: unknown = {}): SettingsT => {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) {
 		throw new Error('Invalid settings.');
 	}
+
 	const input = value as Record<string, unknown>;
 	const seed = input.seed === '' || input.seed == null ? null : input.seed;
 	if (seed !== null && (typeof seed !== 'number' || !Number.isSafeInteger(seed) || seed < 0)) {
 		throw new Error('Seed must be a whole number between 0 and 9007199254740991.');
 	}
+
 	const method = input.restore_mode ?? defaultSettings.restore_mode;
 	if (method !== 'gaussian' && method !== 'edge') {
 		throw new Error('Invalid restoration method.');
 	}
+
 	const device = input.device ?? 'auto';
 	const offload = input.offload ?? 'auto';
 	const precision = input.precision ?? 'auto';
 	if (typeof device !== 'string' || !device || device.length > 100) {
 		throw new Error('Invalid runtime settings.');
 	}
+
 	if (offload !== 'auto' && offload !== 'sequential' && offload !== 'model' && offload !== 'none') {
 		throw new Error('Unsupported runtime settings.');
 	}
+
 	if (precision !== 'auto' && precision !== 'bfloat16' && precision !== 'float32') {
 		throw new Error('Unsupported runtime settings.');
 	}
@@ -101,7 +109,10 @@ export const normalizeSettings = (value: unknown = {}): SettingsT => {
 export const readSettings = (defaultSteps = defaultSettings.steps): SettingsT => {
 	try {
 		const value: unknown = JSON.parse(localStorage.getItem(settingsKey) ?? '{}');
-		if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid settings.');
+		if (!value || typeof value !== 'object' || Array.isArray(value)) {
+			throw new Error('Invalid settings.');
+		}
+
 		return normalizeSettings({ steps: defaultSteps, ...value });
 	} catch {
 		throw new Error('Could not read saved settings. Using defaults.');
@@ -110,6 +121,7 @@ export const readSettings = (defaultSteps = defaultSettings.steps): SettingsT =>
 
 export const persistSettings = (value: SettingsT): void => {
 	const normalized = normalizeSettings(value);
+
 	try {
 		localStorage.setItem(settingsKey, JSON.stringify(normalized));
 	} catch {
@@ -121,13 +133,15 @@ export const configurationProblem = (value: SettingsT, session: SessionT | null)
 	if (!session) {
 		return 'Available models are still loading.';
 	}
+
 	for (const [key, inventory, label] of [
 		['transformer', session.models, 'model'],
 		['lightning', session.lightning_adapters, 'Lightning adapter']
 	] as const) {
 		if (!inventory.length) {
-			return `No ${label} found. Add weights to ai/ and click Refresh.`;
+			return `No ${label} found. Add weights to inference/models/ and click Refresh.`;
 		}
+
 		if (value[key] && !inventory.some((item) => item.path === value[key])) {
 			return `Selected ${label} is unavailable. Choose another in Settings.`;
 		}
@@ -135,11 +149,13 @@ export const configurationProblem = (value: SettingsT, session: SessionT | null)
 	if (!session.runtime.ready) {
 		return 'Device detection is not ready.';
 	}
+
 	const deviceId = value.device === 'auto' ? session.runtime.default_device : value.device;
 	const device = session.runtime.devices.find((item) => item.id === deviceId);
 	if (!device) {
 		return 'Selected device is unavailable. Choose another in Settings.';
 	}
+
 	for (const [key, available] of [
 		['offload', device.offload_modes],
 		['precision', device.precisions]
@@ -148,6 +164,7 @@ export const configurationProblem = (value: SettingsT, session: SessionT | null)
 			return `Selected ${key} is unavailable for this device.`;
 		}
 	}
+
 	return '';
 };
 
@@ -161,9 +178,28 @@ export const migrateModelPaths = (value: SettingsT, session: SessionT): Settings
 		if (!path) {
 			continue;
 		}
+
 		const exact = inventory.find((item) => item.path === path);
-		const filename = path.includes('/') ? undefined : inventory.find((item) => item.name === path);
-		migrated[key] = exact?.path || filename?.path || path;
+		if (exact) {
+			continue;
+		}
+
+		const relative = path.replace(/^\.\//u, '');
+		const parts = relative.split('/');
+		const filename = parts[parts.length - 1] || '';
+		const bareFilename = parts.length === 1;
+		const relativeAiPath = parts.length === 2 && parts[0]?.toLowerCase() === 'ai';
+		const absolutePath = relative.startsWith('/') || /^[a-z]:\//iu.test(relative);
+		const absoluteAiPath = absolutePath && parts[parts.length - 2]?.toLowerCase() === 'ai';
+		if (!bareFilename && !relativeAiPath && !absoluteAiPath) {
+			continue;
+		}
+
+		const matches = inventory.filter((item) => item.name.toLowerCase() === filename.toLowerCase());
+		if (matches.length === 1) {
+			migrated[key] = matches[0]?.path || path;
+		}
 	}
+
 	return migrated;
 };

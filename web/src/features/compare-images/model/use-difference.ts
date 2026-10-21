@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { ImagePairT } from '../../../entities/editor-session';
-import type { NotifyT } from '../../../shared/lib';
+import type { ImagePairT } from '@entities/editor-session';
+import type { NotifyT } from '@lib';
 import type { ViewModeT } from './view-mode.d';
 import type { DiffChannelT, DiffOptionsT } from './diff.d';
 import { DiffClient } from './diff-client';
@@ -20,11 +20,13 @@ const createDifferenceService = () => {
 	let client: DiffClient | null = null;
 	let revision = 0;
 	let options: DiffOptionsT | null = null;
+
 	const getClient = () => {
 		if (!client) {
 			const worker = new Worker(new URL('./diff-worker.ts', import.meta.url), { type: 'module' });
 			client = new DiffClient(worker);
 		}
+
 		return client;
 	};
 	const renderer = new DiffRenderer({
@@ -33,6 +35,7 @@ const createDifferenceService = () => {
 			client?.invalidate(retain);
 		}
 	});
+
 	const dispose = () => {
 		revision++;
 		options = null;
@@ -40,15 +43,19 @@ const createDifferenceService = () => {
 		client?.dispose();
 		client = null;
 	};
+
 	const update = (next: DiffOptionsT | null) => {
 		revision++;
 		options = next;
 		renderer.setOptions(next);
 	};
+
 	const snapshot = () => {
 		const currentRevision = revision;
+
 		return { options, isCurrent: () => currentRevision === revision };
 	};
+
 	return { renderer, dispose, update, snapshot };
 };
 
@@ -93,7 +100,9 @@ export const useDifference = ({
 		if (mode !== 'diff' || !key) {
 			return;
 		}
+
 		let active = true;
+
 		const update = async () => {
 			try {
 				const image = await renderer.ensure();
@@ -108,6 +117,7 @@ export const useDifference = ({
 			}
 		};
 		void update();
+
 		return () => {
 			active = false;
 		};
@@ -117,5 +127,6 @@ export const useDifference = ({
 		return renderer.ensure();
 	};
 	const canvas = preview.key === key ? preview.canvas : null;
+
 	return { canvas, ensure, snapshot: service.snapshot };
 };

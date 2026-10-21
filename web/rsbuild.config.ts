@@ -4,6 +4,9 @@ import { pluginReact } from '@rsbuild/plugin-react';
 const backend = `http://127.0.0.1:${process.env.DESYNTH_BACKEND_PORT || '8758'}`;
 
 export default defineConfig({
+	resolve: {
+		aliasStrategy: 'prefer-tsconfig'
+	},
 	plugins: [
 		pluginReact({
 			reactCompiler: true

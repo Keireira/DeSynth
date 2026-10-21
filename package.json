@@ -7,9 +7,9 @@
     "preview": "pnpm --filter desynth-web preview",
     "test": "pnpm --filter desynth-web test",
     "typecheck": "pnpm --filter desynth-web typecheck",
-    "lint": "oxlint --deny-warnings web/src web/rsbuild.config.ts web/vitest.config.ts",
-    "format": "oxfmt --write \"web/src/**/*.{ts,tsx}\" \"web/*.ts\" web/package.json web/tsconfig.json package.json pnpm-workspace.yaml .oxfmtrc.json .oxlintrc.json .zed/settings.json",
-    "format:check": "oxfmt --check \"web/src/**/*.{ts,tsx}\" \"web/*.ts\" web/package.json web/tsconfig.json package.json pnpm-workspace.yaml .oxfmtrc.json .oxlintrc.json .zed/settings.json",
+    "lint": "oxlint --deny-warnings web/src web/rsbuild.config.ts web/vitest.config.ts scripts/web-dev.mjs",
+    "format": "oxfmt --write \"web/src/**/*.{ts,tsx}\" \"web/*.ts\" scripts/web-dev.mjs web/package.json web/tsconfig.json package.json pnpm-workspace.yaml .oxfmtrc.json .oxlintrc.json .zed/settings.json",
+    "format:check": "oxfmt --check \"web/src/**/*.{ts,tsx}\" \"web/*.ts\" scripts/web-dev.mjs web/package.json web/tsconfig.json package.json pnpm-workspace.yaml .oxfmtrc.json .oxlintrc.json .zed/settings.json",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test"
   },
   "devDependencies": {

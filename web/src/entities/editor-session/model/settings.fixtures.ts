@@ -3,11 +3,13 @@ import type { SessionT } from './editor-session.d';
 export const session: SessionT = {
 	ready: true,
 	models: [
-		{ path: 'ai/Q4.gguf', name: 'Q4.gguf' },
-		{ path: 'ai/Q8.gguf', name: 'Q8.gguf' }
+		{ path: 'inference/models/Q4.gguf', name: 'Q4.gguf' },
+		{ path: 'inference/models/Q8.gguf', name: 'Q8.gguf' }
 	],
-	lightning_adapters: [{ path: 'ai/8steps.safetensors', name: '8steps.safetensors', label: '8 steps · FP32' }],
-	default_lightning: 'ai/8steps.safetensors',
+	lightning_adapters: [
+		{ path: 'inference/models/8steps.safetensors', name: '8steps.safetensors', label: '8 steps · FP32' }
+	],
+	default_lightning: 'inference/models/8steps.safetensors',
 	default_steps: 32,
 	assets: [],
 	default_source_id: null,
@@ -28,4 +30,14 @@ export const session: SessionT = {
 			{ id: 'cpu', name: 'CPU', type: 'cpu', offload_modes: ['none'], precisions: ['float32'] }
 		]
 	}
+};
+
+export const legacySession: SessionT = {
+	...session,
+	models: session.models.map((item) => ({ ...item, path: item.path.replace('inference/models/', 'ai/') })),
+	lightning_adapters: session.lightning_adapters.map((item) => ({
+		...item,
+		path: item.path.replace('inference/models/', 'ai/')
+	})),
+	default_lightning: 'ai/8steps.safetensors'
 };

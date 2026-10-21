@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AssetT } from '../../../entities/editor-session';
+import type { AssetT } from '@entities/editor-session';
 import { loadImage, readFile } from './image-io';
 
 const asset: AssetT = {
