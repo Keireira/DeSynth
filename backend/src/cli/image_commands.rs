@@ -80,14 +80,24 @@ pub(super) fn diff(root: &Path, args: DiffArgs) -> Result<()> {
     let result = load(&result_path)?;
     let visual = images::difference(&source, &result, args.gain, DiffChannel::Rgba)?;
     write_image(&output, &visual, None)?;
-    if let Some(raw) = raw {
+    if let Some(raw) = raw.as_deref() {
+        // Recheck after publishing: on a case-insensitive filesystem two future
+        // paths can resolve to the same newly created file despite different spelling.
+        check_output(raw, &[&source_path, &result_path, &output])?;
         write_image(
-            &raw,
+            raw,
             &images::difference(&source, &result, args.gain, DiffChannel::Raw)?,
             None,
         )?;
     }
-    if let Some(preview) = preview {
+    if let Some(preview) = preview.as_deref() {
+        let mut protected = vec![
+            source_path.as_path(),
+            result_path.as_path(),
+            output.as_path(),
+        ];
+        protected.extend(raw.as_deref());
+        check_output(preview, &protected)?;
         let mut image = RgbaImage::new(source.width() * 2, source.height());
         image::imageops::replace(
             &mut image,
@@ -101,7 +111,7 @@ pub(super) fn diff(root: &Path, args: DiffArgs) -> Result<()> {
             i64::from(source.width()),
             0,
         );
-        write_image(&preview, &image, None)?;
+        write_image(preview, &image, None)?;
     }
     let mut changed = 0_u64;
     let mut rgba_delta = 0_u64;
@@ -173,6 +183,32 @@ mod tests {
         let future = directory.path().join("new/nested.png");
         assert!(check_output(&future, &[&future]).is_err());
         check_output(&future, &[&source])?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn differently_cased_diff_destinations_cannot_overwrite_the_visible_diff() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let source = RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 0]));
+        let result = RgbaImage::from_pixel(1, 1, image::Rgba([11, 20, 30, 0]));
+        std::fs::write(root.join("source.png"), images::encode_png(&source, None)?)?;
+        std::fs::write(root.join("result.png"), images::encode_png(&result, None)?)?;
+        let outcome = diff(
+            root,
+            DiffArgs {
+                original: "source.png".into(),
+                result: "result.png".into(),
+                out: "diff.png".into(),
+                gain: 8.0,
+                raw_out: Some("DIFF.PNG".into()),
+                preview_out: None,
+            },
+        );
+        assert!(outcome.is_err());
+        let saved = images::open(&std::fs::read(root.join("diff.png"))?)?;
+        assert_eq!(saved.get_pixel(0, 0), &image::Rgba([8, 0, 0, 255]));
         Ok(())
     }
 }

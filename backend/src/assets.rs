@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 use uuid::Uuid;
@@ -27,6 +28,14 @@ pub struct StoredAsset {
     pub path: PathBuf,
     pub temporary_bytes: Option<u64>,
     pub metadata: Option<Value>,
+    readers: Arc<()>,
+}
+
+impl StoredAsset {
+    /// Borrow the whole entry so its cache lease survives queued CPU work.
+    pub fn read_image(&self) -> Result<RgbaImage> {
+        images::open(&std::fs::read(&self.path)?)
+    }
 }
 
 /// A newly written file is removed if its request is canceled before committing it.
@@ -154,6 +163,7 @@ impl Assets {
             path,
             temporary_bytes: None,
             metadata,
+            readers: Arc::new(()),
         })
     }
 
@@ -205,6 +215,7 @@ impl Assets {
             path,
             temporary_bytes: temporary.then_some(bytes.len() as u64),
             metadata,
+            readers: Arc::new(()),
         })))
     }
 
@@ -242,6 +253,9 @@ impl Assets {
             let Some(entry) = self.entries.get(&id) else {
                 continue;
             };
+            if Arc::strong_count(&entry.readers) > 1 {
+                continue;
+            }
             let excess_temp = entry.temporary_bytes.is_some()
                 && (temporary_count > 48 || temporary_bytes > 512 * 1024 * 1024);
             if self.entries.len() <= 128 && !excess_temp {

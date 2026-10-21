@@ -229,8 +229,8 @@ fn reflect(mut index: isize, length: usize) -> usize {
     index as usize
 }
 
-/// Lanczos-4 sampling is used for restoring pipeline output to the source dimensions.
-/// Alpha is deliberately ignored; the source alpha is copied after restoration.
+/// Sample channels independently so RGB hidden beneath alpha=0 is retained.
+/// Restoration copies source alpha afterwards; CLI comparison keeps the resized alpha.
 fn resize_clean(clean: &RgbaImage, width: u32, height: u32) -> RgbaImage {
     if clean.dimensions() == (width, height) {
         return clean.clone();
@@ -265,13 +265,13 @@ fn resize_clean(clean: &RgbaImage, width: u32, height: u32) -> RgbaImage {
     };
     let x_weights = coefficients(clean.width(), width);
     let y_weights = coefficients(clean.height(), height);
-    let mut horizontal = vec![[0.0_f32; 3]; width as usize * clean.height() as usize];
+    let mut horizontal = vec![[0.0_f32; 4]; width as usize * clean.height() as usize];
     for y in 0..clean.height() {
         for (x, weights) in x_weights.iter().enumerate() {
             let output = &mut horizontal[y as usize * width as usize + x];
             for (source_x, weight) in weights {
                 let pixel = clean.get_pixel(*source_x, y);
-                for channel in 0..3 {
+                for channel in 0..4 {
                     output[channel] += f32::from(pixel[channel]) * weight;
                 }
             }
@@ -280,22 +280,17 @@ fn resize_clean(clean: &RgbaImage, width: u32, height: u32) -> RgbaImage {
     let mut result = RgbaImage::new(width, height);
     for (y, weights) in y_weights.iter().enumerate() {
         for x in 0..width as usize {
-            let mut color = [0.0_f32; 3];
+            let mut color = [0.0_f32; 4];
             for (source_y, weight) in weights {
                 let pixel = horizontal[*source_y as usize * width as usize + x];
-                for channel in 0..3 {
+                for channel in 0..4 {
                     color[channel] += pixel[channel] * weight;
                 }
             }
             result.put_pixel(
                 x as u32,
                 y as u32,
-                Rgba([
-                    color[0].round_ties_even().clamp(0.0, 255.0) as u8,
-                    color[1].round_ties_even().clamp(0.0, 255.0) as u8,
-                    color[2].round_ties_even().clamp(0.0, 255.0) as u8,
-                    255,
-                ]),
+                Rgba(color.map(|value| value.round_ties_even().clamp(0.0, 255.0) as u8)),
             );
         }
     }
@@ -309,6 +304,20 @@ pub fn resize_for_comparison(image: &RgbaImage, width: u32, height: u32) -> Rgba
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_resize_keeps_alpha_separate_from_hidden_rgb() {
+        let source = RgbaImage::from_fn(2, 1, |x, _| Rgba([80, 120, 200, (x * 200) as u8]));
+        let result = resize_for_comparison(&source, 3, 1);
+        assert_eq!(result.get_pixel(1, 0), &Rgba([80, 120, 200, 100]));
+        assert!(result.pixels().all(|pixel| pixel.0[..3] == [80, 120, 200]));
+        let transparent = RgbaImage::from_pixel(2, 2, Rgba([80, 120, 200, 0]));
+        assert!(
+            resize_for_comparison(&transparent, 5, 7)
+                .pixels()
+                .all(|pixel| *pixel == Rgba([80, 120, 200, 0]))
+        );
+    }
 
     #[test]
     fn both_methods_preserve_every_source_alpha_when_pipeline_size_differs() -> Result<()> {

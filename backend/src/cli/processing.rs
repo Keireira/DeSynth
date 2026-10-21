@@ -89,7 +89,8 @@ async fn process_sweep(studio: Arc<Studio>, args: RunArgs) -> Result<()> {
     }
     let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_owned();
     let directory = output.join("runs").join(&run_id);
-    std::fs::create_dir_all(&directory)?;
+    std::fs::create_dir_all(output.join("runs"))?;
+    std::fs::create_dir(&directory)?;
     let stem: String = input
         .file_stem()
         .unwrap_or_default()
@@ -134,9 +135,7 @@ async fn process_sweep(studio: Arc<Studio>, args: RunArgs) -> Result<()> {
             .as_array_mut()
             .context("Run manifest has no outputs")?
             .push(record);
-        let temporary = manifest_path.with_extension("json.tmp");
-        std::fs::write(&temporary, serde_json::to_vec_pretty(&manifest)?)?;
-        std::fs::rename(temporary, &manifest_path)?;
+        super::files::write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
     }
     println!("Run metadata: {}", manifest_path.display());
     Ok(())
@@ -305,11 +304,7 @@ fn archive_result(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let model_tag = model_name
-        .rsplit('-')
-        .next()
-        .unwrap_or(&model_name)
-        .to_lowercase();
+    let model_tag = model_filename_tag(&model_name);
     let adapter_name = result
         .metadata
         .as_ref()
@@ -339,11 +334,44 @@ fn archive_result(
     }
     let prefix = format!("{stem}_desynth_{tag}_{run_id}_{index:02}");
     let final_path = directory.join(format!("{prefix}.png"));
-    std::fs::copy(&result.path, &final_path)?;
+    let reference = if is_reference(input, &studio.root) {
+        let path = studio
+            .root
+            .join("out")
+            .join(format!("{}.png", reference_stem(params)?));
+        let comparison = path.with_file_name(format!(
+            "comparison_{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        Some((path, comparison))
+    } else {
+        None
+    };
+    let intermediate = (params["restore"] == true && params["keep_intermediate"] == true)
+        .then(|| directory.join(format!("{prefix}_clean.png")));
+    let comparison_path = directory.join(format!("comparison_{prefix}.png"));
+    let mut protected = vec![input.to_path_buf(), result.path.clone(), clean.path.clone()];
+    let mut outputs = vec![final_path.as_path()];
+    outputs.extend(intermediate.as_deref());
+    if let Some((path, comparison)) = &reference {
+        outputs.extend([
+            comparison_path.as_path(),
+            path.as_path(),
+            comparison.as_path(),
+        ]);
+    }
+    for output in outputs {
+        super::image_commands::check_output(
+            output,
+            &protected.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+        )?;
+        protected.push(output.to_path_buf());
+    }
+    super::files::copy(&result.path, &final_path)?;
     println!("  -> {}", final_path.display());
     let original = images::open(&std::fs::read(input)?)?;
     let mut clean_path = None;
-    if params["restore"] == true && params["keep_intermediate"] == true {
+    if let Some(path) = intermediate {
         let clean_image = images::open(&std::fs::read(&clean.path)?)?;
         let clean_image = images::finish(
             &clean_image,
@@ -353,32 +381,19 @@ fn archive_result(
                 ..Default::default()
             },
         )?;
-        let path = directory.join(format!("{prefix}_clean.png"));
         write_image(&path, &clean_image, clean.metadata.as_ref())?;
         clean_path = Some(path);
     }
     let denoise = params["denoise"].as_f64().context("Denoise is missing")?;
     let steps = params["steps"].as_u64().context("Step count is missing")? as u32;
     let mut record = json!({"kind":"result","path":final_path,"name":final_path.file_name().unwrap_or_default().to_string_lossy(),"denoise":denoise,"starting_sigma":denoise,"effective_steps":parameters::effective_img2img_steps(steps,denoise),"clean_path":clean_path,"transformer":job["transformer"],"lightning":job["lightning"],"runtime":job["runtime"],"seed":job["seed"]});
-    if is_reference(input, &studio.root) {
+    if let Some((reference_path, reference_comparison)) = reference {
         let final_image = images::open(&std::fs::read(&result.path)?)?;
         let metrics = images::extended_metrics(&original, &final_image)?;
         let comparison = images::comparison_visual(&original, &final_image, &metrics)?;
-        let comparison_path = directory.join(format!("comparison_{prefix}.png"));
         write_image(&comparison_path, &comparison, None)?;
-        let reference_path = studio
-            .root
-            .join("out")
-            .join(format!("{}.png", reference_stem(params)?));
-        let reference_comparison = reference_path.with_file_name(format!(
-            "comparison_{}",
-            reference_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ));
-        std::fs::copy(&final_path, &reference_path)?;
-        std::fs::copy(&comparison_path, &reference_comparison)?;
+        super::files::copy(&final_path, &reference_path)?;
+        super::files::copy(&comparison_path, &reference_comparison)?;
         println!("  -> {}", reference_path.display());
         println!("  -> {}", reference_comparison.display());
         record["reference_path"] = json!(reference_path);
@@ -407,6 +422,30 @@ fn is_reference(input: &Path, root: &Path) -> bool {
         (Ok(input), Ok(reference)) => input == reference,
         _ => false,
     }
+}
+
+fn model_filename_tag(stem: &str) -> String {
+    let suffix = stem.rsplit('-').next().unwrap_or(stem);
+    let mut characters = suffix.chars();
+    let quant = characters
+        .next()
+        .is_some_and(|character| matches!(character, 'q' | 'Q' | 'i' | 'I'))
+        && characters
+            .next()
+            .is_some_and(|character| character.is_ascii_digit());
+    let selected = if quant { suffix } else { stem };
+    let tag: String = selected
+        .chars()
+        .take(32)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if tag.is_empty() { "model".into() } else { tag }
 }
 
 fn reference_stem(params: &Value) -> Result<String> {
@@ -583,6 +622,51 @@ mod tests {
                 .count(),
             2
         );
+        studio.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reference_aliases_cannot_overwrite_original_and_long_model_names_are_bounded()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let original = image::RgbaImage::from_pixel(8, 8, image::Rgba([80, 90, 100, 17]));
+        let input = root.join("original.png");
+        let original_bytes = images::encode_png(&original, None)?;
+        std::fs::write(&input, &original_bytes)?;
+        let studio = Studio::new(root.to_owned(), root.join("missing-python"))?;
+        let job = {
+            let mut store = studio.store.lock();
+            let clean = store
+                .assets
+                .save(&original, "clean", "clean.png", false, None)?;
+            let result = store
+                .assets
+                .save(&original, "result", "result.png", false, None)?;
+            json!({"seed":42,"transformer":format!("custom-{}.gguf", "x".repeat(230)),"clean":clean,"result":result})
+        };
+        let archive_directory = root.join("out/runs/long-name");
+        std::fs::create_dir_all(&archive_directory)?;
+        let archive = RunArchive {
+            input: &input,
+            directory: &archive_directory,
+            stem: "original",
+            run_id: "long-name",
+        };
+        let params = json!({"steps":32,"denoise":0.25,"passes":1,"restore_sigma":1.95,"restore":true,"restore_mode":"edge","unsharp":0.0,"keep_intermediate":false});
+        let alias = root.join("out/Original_desynth_s32_d0.250_p1_r1.95_edge.png");
+        std::fs::hard_link(&input, &alias)?;
+        let error = archive_result(&studio, &archive, 1, &params, &job).unwrap_err();
+        assert!(error.to_string().contains("must not overwrite"));
+        assert_eq!(std::fs::read(&input)?, original_bytes);
+        assert_eq!(std::fs::read_dir(&archive_directory)?.count(), 0);
+        std::fs::remove_file(alias)?;
+        let record = archive_result(&studio, &archive, 1, &params, &job)?;
+        let path = Path::new(record["path"].as_str().context("Archived result missing")?);
+        assert!(path.is_file());
+        assert!(path.file_name().unwrap().to_string_lossy().len() < 200);
+        assert_eq!(std::fs::read(input)?, original_bytes);
         studio.close().await;
         Ok(())
     }

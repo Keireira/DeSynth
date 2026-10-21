@@ -10,6 +10,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+const MAX_FRAME_BYTES: usize = 65536;
+
 #[derive(Debug)]
 pub struct InferenceError {
     pub message: String,
@@ -133,13 +135,18 @@ impl Inference {
     /// Interrupts active sampling and reaps the subprocess before returning.
     pub async fn shutdown(&self) -> Result<(), InferenceError> {
         self.shutdown.send_replace(true);
-        let task = self.task.lock().await.take();
-        if let Some(task) = task {
-            task.await.map_err(|error| {
+        // Keep ownership of the handle until cleanup finishes. Another caller
+        // must wait too, and canceling this future must not detach the worker.
+        let mut task = self.task.lock().await;
+        let result = if let Some(active) = task.as_mut() {
+            active.await.map_err(|error| {
                 InferenceError::transport(format!("Inference supervisor failed: {error}"))
-            })?;
-        }
-        Ok(())
+            })
+        } else {
+            Ok(())
+        };
+        task.take();
+        result
     }
 }
 
@@ -194,29 +201,20 @@ impl Session {
         payload["id"] = json!(id);
         let mut bytes = serde_json::to_vec(&payload).map_err(ExecutionError::protocol)?;
         bytes.push(b'\n');
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(ExecutionError {
+                error: InferenceError::transport("Inference request exceeds 64 KiB"),
+                restart: false,
+            });
+        }
         self.stdin
             .write_all(&bytes)
             .await
             .map_err(ExecutionError::protocol)?;
         self.stdin.flush().await.map_err(ExecutionError::protocol)?;
         loop {
-            let mut line = String::new();
-            let count = self
-                .stdout
-                .read_line(&mut line)
-                .await
+            let event: Value = serde_json::from_slice(&self.read_frame().await?)
                 .map_err(ExecutionError::protocol)?;
-            if count == 0 {
-                return Err(ExecutionError::protocol(
-                    "Inference subprocess closed its output",
-                ));
-            }
-            if count > 65536 {
-                return Err(ExecutionError::protocol(
-                    "Inference response exceeds 64 KiB",
-                ));
-            }
-            let event: Value = serde_json::from_str(&line).map_err(ExecutionError::protocol)?;
             if event["id"].as_u64() != Some(id) {
                 return Err(ExecutionError::protocol(
                     "Inference response has an unexpected command id",
@@ -259,6 +257,34 @@ impl Session {
                     });
                 }
                 _ => return Err(ExecutionError::protocol("Unknown inference response event")),
+            }
+        }
+    }
+
+    async fn read_frame(&mut self) -> Result<Vec<u8>, ExecutionError> {
+        let mut frame = Vec::new();
+        loop {
+            let buffered = self
+                .stdout
+                .fill_buf()
+                .await
+                .map_err(ExecutionError::protocol)?;
+            if buffered.is_empty() {
+                return Err(ExecutionError::protocol(
+                    "Inference subprocess closed its output before a complete frame",
+                ));
+            }
+            let end = buffered.iter().position(|byte| *byte == b'\n');
+            let count = end.map_or(buffered.len(), |position| position + 1);
+            if frame.len() + count > MAX_FRAME_BYTES {
+                return Err(ExecutionError::protocol(
+                    "Inference response exceeds 64 KiB",
+                ));
+            }
+            frame.extend_from_slice(&buffered[..count]);
+            self.stdout.consume(count);
+            if end.is_some() {
+                return Ok(frame);
             }
         }
     }
@@ -351,5 +377,72 @@ async fn supervise(
         let _ = command.response.send(Err(InferenceError::transport(
             "Inference worker is stopped",
         )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn delayed_shutdown() -> (Arc<Inference>, oneshot::Sender<()>) {
+        let (commands, _receiver) = mpsc::channel(1);
+        let (shutdown, mut stop) = watch::channel(false);
+        let (finish, finished) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = stop.changed().await;
+            let _ = finished.await;
+        });
+        (
+            Arc::new(Inference {
+                commands,
+                shutdown,
+                task: Mutex::new(Some(task)),
+            }),
+            finish,
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_callers_wait_for_the_same_cleanup() {
+        let (worker, finish) = delayed_shutdown();
+        let first_owner = worker.clone();
+        let first = tokio::spawn(async move { first_owner.shutdown().await });
+        while !*worker.shutdown.borrow() {
+            tokio::task::yield_now().await;
+        }
+        let second_owner = worker.clone();
+        let mut second = tokio::spawn(async move { second_owner.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+        finish.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceling_a_shutdown_wait_keeps_cleanup_joinable() {
+        let (worker, finish) = delayed_shutdown();
+        let first_owner = worker.clone();
+        let first = tokio::spawn(async move { first_owner.shutdown().await });
+        while !*worker.shutdown.borrow() {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        let _ = first.await;
+        let next_owner = worker.clone();
+        let mut next = tokio::spawn(async move { next_owner.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut next)
+                .await
+                .is_err()
+        );
+        finish.send(()).unwrap();
+        next.await.unwrap().unwrap();
+        worker.shutdown().await.unwrap();
     }
 }

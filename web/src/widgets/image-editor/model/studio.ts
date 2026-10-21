@@ -37,8 +37,10 @@ export const createStudio = () => {
 	const listeners = new Set<() => void>();
 	let life: AbortController | null = null;
 	let uploadTask: AbortController | null = null;
+	let restoreAfterUpload = false;
 	let generation = 0;
 	let resultVersion = 0;
+	let inventoryRevision = 0;
 	let noticeId = 0;
 
 	const update = (patch: Partial<StudioStateT>) => {
@@ -163,22 +165,38 @@ export const createStudio = () => {
 		}
 	};
 
-	const pollInventory = async (initial: SessionT, signal: AbortSignal) => {
+	const pollInventory = async (initial: SessionT, signal: AbortSignal, revision: number) => {
 		let session = initial;
 		for (let attempts = 0; !session.runtime.ready || session.runtime.refreshing; attempts++) {
+			if (signal.aborted || revision !== inventoryRevision) {
+				return;
+			}
+
 			if (attempts >= 120) {
 				throw new Error('Device refresh timed out. Click Refresh to try again.');
 			}
 
 			await delay(500, signal);
-			session = await api.session(signal);
-			if (signal.aborted) {
+			if (revision !== inventoryRevision) {
+				return;
+			}
+
+			try {
+				session = await api.session(signal);
+			} catch (error) {
+				if (signal.aborted || revision !== inventoryRevision) {
+					return;
+				}
+
+				throw error;
+			}
+			if (signal.aborted || revision !== inventoryRevision) {
 				return;
 			}
 
 			updateInventory(session);
 		}
-		if (session.runtime.error) {
+		if (revision === inventoryRevision && session.runtime.error) {
 			throw new Error(`Device detection failed: ${session.runtime.error}`);
 		}
 	};
@@ -189,6 +207,7 @@ export const createStudio = () => {
 		}
 
 		const signal = life.signal;
+		const revision = ++inventoryRevision;
 		update({ refreshing: true });
 
 		try {
@@ -198,7 +217,7 @@ export const createStudio = () => {
 			}
 
 			updateInventory(session);
-			await pollInventory(session, signal);
+			await pollInventory(session, signal, revision);
 		} catch (error) {
 			if (!signal.aborted) {
 				throw error;
@@ -240,6 +259,8 @@ export const createStudio = () => {
 		}
 
 		const signal = life.signal;
+		let restoreInterrupted = false;
+		let completed = false;
 
 		try {
 			const params = validatedSettings();
@@ -252,6 +273,7 @@ export const createStudio = () => {
 				throw new Error('Run make setup to enable processing.');
 			}
 
+			restoreInterrupted = state.restoring;
 			restoration.cancel();
 			resultVersion++;
 			update({
@@ -260,6 +282,7 @@ export const createStudio = () => {
 			});
 			const job = await api.process(state.source.asset, params, signal);
 			await followJob(job.id, signal);
+			completed = true;
 		} catch (error) {
 			if (!signal.aborted) {
 				report(error);
@@ -267,6 +290,9 @@ export const createStudio = () => {
 		} finally {
 			if (!signal.aborted) {
 				update({ processing: false, progress: null });
+				if (restoreInterrupted && !completed) {
+					scheduleRestore();
+				}
 			}
 		}
 	};
@@ -285,6 +311,8 @@ export const createStudio = () => {
 		const task = new AbortController();
 		uploadTask = task;
 		const token = ++generation;
+		restoreAfterUpload ||= state.restoring;
+		let installed = false;
 		restoration.cancel();
 		resultVersion++;
 		update({ uploading: true, exportRevision: state.exportRevision + 1 });
@@ -306,6 +334,7 @@ export const createStudio = () => {
 			}
 
 			update({ source: image, result: null, clean: null, metrics: null, mode: 'original' });
+			installed = true;
 			remember();
 		} catch (error) {
 			if (token === generation) {
@@ -315,6 +344,10 @@ export const createStudio = () => {
 			if (token === generation && !task.signal.aborted) {
 				uploadTask = null;
 				update({ uploading: false });
+				if (restoreAfterUpload && !installed) {
+					scheduleRestore();
+				}
+				restoreAfterUpload = false;
 			}
 		}
 	};
@@ -339,8 +372,8 @@ export const createStudio = () => {
 		const active: JobT | null = session.active_job_id ? await api.job(session.active_job_id, signal) : null;
 		const selectedSource = active?.source_id || selection.source;
 		const source =
-			session.assets.find((asset) => asset.id === selectedSource) ||
-			session.assets.find((asset) => asset.id === session.default_source_id);
+			session.assets.find((asset) => asset.id === selectedSource && asset.kind === 'source') ||
+			session.assets.find((asset) => asset.id === session.default_source_id && asset.kind === 'source');
 		if (!source) {
 			return active;
 		}
@@ -351,12 +384,15 @@ export const createStudio = () => {
 		}
 
 		update({ source: image });
+		const savedSourceMatches = selection.source === source.id;
 		const result =
-			session.assets.find((asset) => asset.id === selection.result) ||
+			session.assets.find((asset) => savedSourceMatches && asset.id === selection.result && asset.kind === 'result') ||
 			(source.id === session.default_source_id
-				? session.assets.find((asset) => asset.id === session.default_result_id)
+				? session.assets.find((asset) => asset.id === session.default_result_id && asset.kind === 'result')
 				: null);
-		const clean = session.assets.find((asset) => asset.id === selection.clean && asset.kind === 'clean') ?? null;
+		const clean =
+			session.assets.find((asset) => savedSourceMatches && asset.id === selection.clean && asset.kind === 'clean') ??
+			null;
 		if (!active && result && result.width === source.width && result.height === source.height) {
 			await assignResult(result, null, clean, () => !signal.aborted, signal);
 			if (!signal.aborted) {
@@ -370,6 +406,7 @@ export const createStudio = () => {
 
 	const start = () => {
 		const task = new AbortController();
+		const revision = ++inventoryRevision;
 		life = task;
 		update({ initializing: true, processing: false, uploading: false, refreshing: false, progress: null });
 
@@ -397,7 +434,7 @@ export const createStudio = () => {
 				settings = migrateModelPaths(settings, session);
 				update({ session, settings, seed: settings.seed == null ? '' : String(settings.seed) });
 				if (!session.runtime.ready || session.runtime.refreshing) {
-					void pollInventory(session, task.signal).catch(reportStartup);
+					void pollInventory(session, task.signal, revision).catch(reportStartup);
 				}
 				const active = await initializeImages(session, task.signal);
 				if (task.signal.aborted) {
@@ -429,6 +466,7 @@ export const createStudio = () => {
 		return () => {
 			task.abort();
 			uploadTask?.abort();
+			restoreAfterUpload = false;
 			restoration.cancel();
 			generation++;
 			resultVersion++;

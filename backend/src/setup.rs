@@ -496,7 +496,31 @@ where
     Request: FnOnce(u64) -> Reply,
     Reply: std::future::Future<Output = Result<reqwest::Response>>,
 {
+    let lock_path = directory.join(format!(".{}.download.lock", identity.filename));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("Cannot open download lock {}", lock_path.display()))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "Another download of {} is already running",
+            identity.filename
+        ),
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(error).context("Cannot lock the model download");
+        }
+    }
+    // Keep this inode and its lock until publication finishes or the future is
+    // canceled; unlinking the lock file would let another writer bypass it.
+    let _download_lock = lock;
     let destination = directory.join(&identity.filename);
+    if crate::catalog::nonempty_file(&destination) {
+        println!("Already present: {}", destination.display());
+        return Ok(());
+    }
     let partial = directory.join(format!(".{}.part", identity.filename));
     let metadata = directory.join(format!(".{}.part.json", identity.filename));
     let cached_identity = fs::read(&metadata)
@@ -844,6 +868,61 @@ mod tests {
             response = response.header("content-range", range);
         }
         reqwest::Response::from(response.body(body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn concurrent_download_is_rejected_and_cancellation_releases_the_file_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = models_directory(root.path());
+        fs::create_dir_all(&directory).await.unwrap();
+        let owner_directory = directory.clone();
+        let (started, pending) = tokio::sync::oneshot::channel();
+        let (_hold, released) = tokio::sync::oneshot::channel::<()>();
+        let first = tokio::spawn(async move {
+            download_file_with_request(
+                &owner_directory,
+                &download_identity(b"abc"),
+                |offset| async move {
+                    assert_eq!(offset, 0);
+                    started.send(()).unwrap();
+                    let _ = released.await;
+                    Ok(response(200, reqwest::Body::from("abc"), 3, None))
+                },
+            )
+            .await
+        });
+        pending.await.unwrap();
+        let metadata_path = directory.join(".model.gguf.part.json");
+        let metadata = fs::read(&metadata_path).await.unwrap();
+        let second =
+            download_file_with_request(&directory, &download_identity(b"xyz"), |_| async {
+                panic!("A competing writer must fail before sending a request")
+            })
+            .await
+            .unwrap_err();
+        assert!(second.to_string().contains("already running"));
+        assert_eq!(fs::read(&metadata_path).await.unwrap(), metadata);
+        first.abort();
+        let _ = first.await;
+        download_file_with_request(
+            &directory,
+            &download_identity(b"abc"),
+            |offset| async move {
+                assert_eq!(offset, 0);
+                Ok(response(200, reqwest::Body::from("abc"), 3, None))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read(directory.join("model.gguf")).await.unwrap(),
+            b"abc"
+        );
+        download_file_with_request(&directory, &download_identity(b"abc"), |_| async {
+            panic!("A completed competing download must be reused without another request")
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -83,6 +83,42 @@ describe('exact RGBA difference worker', () => {
 });
 
 describe('bounded raw pixel cache', () => {
+	it('aborts obsolete pixel downloads when switching to another image pair', async () => {
+		let obsolete: AbortSignal | undefined;
+		const load = vi.fn((_image: AssetT, signal: AbortSignal) => {
+			obsolete = signal;
+			return new Promise<Uint8Array>((_resolve, reject) => {
+				signal.addEventListener('abort', () => reject(new DOMException('Cancelled', 'AbortError')), { once: true });
+			});
+		});
+		const cache = new PixelCache({ load });
+		cache.retain(['old-source', 'old-result']);
+		const old = cache.read(asset('old-source'));
+		const cancelled = expect(old).rejects.toMatchObject({ name: 'AbortError' });
+
+		cache.retain(['new-source', 'new-result']);
+		expect(obsolete?.aborted).toBe(true);
+		await cancelled;
+	});
+
+	it('keeps reusable in-flight pixels when only diff controls change', async () => {
+		const download = deferred<Uint8Array>();
+		let signal: AbortSignal | undefined;
+		const load = vi.fn((_image: AssetT, loading: AbortSignal) => {
+			signal = loading;
+			return download.promise;
+		});
+		const cache = new PixelCache({ load });
+		cache.retain(['source', 'result']);
+		const original = cache.read(asset('source'));
+		cache.retain(['source', 'result']);
+		expect(signal?.aborted).toBe(false);
+		download.resolve(new Uint8Array([20, 30, 40, 0]));
+		await original;
+		expect(Array.from(await cache.read(asset('source')))).toEqual([20, 30, 40, 0]);
+		expect(load).toHaveBeenCalledOnce();
+	});
+
 	it('retains only the current image pair', async () => {
 		const load = vi.fn(async () => new Uint8Array(4));
 		const cache = new PixelCache({ load });

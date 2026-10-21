@@ -144,6 +144,29 @@ describe('studio upload lifecycle', () => {
 });
 
 describe('studio initialization and job recovery', () => {
+	it('does not compare a fallback original with a saved result from an evicted source', async () => {
+		localStorage.setItem(
+			'desynth.selection.v1',
+			JSON.stringify({ source: 'evicted', result: result.id, clean: clean.id })
+		);
+		const projectResult = asset('project-result', 'result');
+		vi.mocked(api.session).mockResolvedValue({
+			...session,
+			assets: [source, result, clean, projectResult],
+			default_source_id: source.id,
+			default_result_id: projectResult.id
+		});
+		const studio = await start();
+
+		expect(studio.getSnapshot()).toMatchObject({
+			source: { asset: source },
+			result: { asset: projectResult },
+			clean: null
+		});
+		await vi.advanceTimersByTimeAsync(500);
+		expect(api.restore).not.toHaveBeenCalled();
+	});
+
 	it('returns refresh errors to the dialog and clears the refresh gate', async () => {
 		const studio = await start();
 		vi.spyOn(api, 'refresh').mockRejectedValue(new Error('Refresh failed'));
@@ -191,6 +214,35 @@ describe('studio initialization and job recovery', () => {
 		await refresh;
 		expect(studio.getSnapshot()).toMatchObject({ refreshing: false, initializing: false, notice: null });
 	});
+
+	it.each(['success', 'failure'] as const)(
+		'ignores stale startup inventory %s after a newer manual Refresh',
+		async (outcome) => {
+			const stale = deferred<typeof session>();
+			const initial = {
+				...session,
+				runtime: { ...session.runtime, ready: false },
+				models: session.models.slice(0, 1),
+				assets: [source],
+				default_source_id: source.id
+			};
+			vi.mocked(api.session).mockResolvedValueOnce(initial).mockReturnValueOnce(stale.promise);
+			vi.spyOn(api, 'refresh').mockResolvedValue(session);
+			const studio = await start();
+			await vi.advanceTimersByTimeAsync(500);
+
+			await studio.refresh();
+			expect(studio.getSnapshot().session?.models).toEqual(session.models);
+			if (outcome === 'success') {
+				stale.resolve({ ...session, models: session.models.slice(0, 1) });
+			} else {
+				stale.reject(new TypeError('Obsolete catalog connection failed'));
+			}
+			await settle();
+			expect(studio.getSnapshot().session?.models).toEqual(session.models);
+			expect(studio.getSnapshot()).toMatchObject({ refreshing: false, initializing: false, notice: null });
+		}
+	);
 
 	it('uses the server adapter schedule by default while retaining explicit saved steps', async () => {
 		vi.mocked(api.session).mockResolvedValue({ ...session, default_steps: 8 });
@@ -394,5 +446,55 @@ describe('restoration precedence', () => {
 			expect.objectContaining({ ...defaultSettings, denoise: 0.5, seed: 42 }),
 			expect.any(AbortSignal)
 		);
+	});
+
+	it('resumes the current restoration after an interrupted upload fails, including a superseded upload', async () => {
+		restoreSavedSelection();
+		const studio = await start();
+		studio.changeSettings({ restore_sigma: 2.5 });
+		const reading = deferred<string>();
+		vi.mocked(readFile).mockReturnValueOnce(reading.promise);
+		const first = studio.upload(new File(['first'], 'first.png'));
+		vi.mocked(readFile).mockRejectedValueOnce(new Error('Broken replacement'));
+		await studio.upload(new File(['second'], 'second.png'));
+		reading.resolve('data:image/png;base64,AA==');
+		await first;
+
+		expect(studio.getSnapshot()).toMatchObject({
+			uploading: false,
+			restoring: true,
+			source: { asset: source },
+			result: { asset: result }
+		});
+		await vi.advanceTimersByTimeAsync(300);
+		expect(api.restore).toHaveBeenLastCalledWith(
+			expect.any(String),
+			expect.any(Number),
+			source,
+			clean,
+			expect.objectContaining({ restore_sigma: 2.5 }),
+			expect.any(AbortSignal)
+		);
+		expect(studio.getSnapshot()).toMatchObject({ restoring: false, result: { asset: { id: 'restored' } } });
+	});
+
+	it('resumes pending restoration after processing fails instead of exporting mismatched old pixels', async () => {
+		restoreSavedSelection();
+		const studio = await start();
+		studio.changeSettings({ restore_mode: 'edge' });
+		vi.mocked(api.process).mockRejectedValueOnce(new Error('Model unavailable'));
+		await studio.process();
+
+		expect(studio.getSnapshot()).toMatchObject({ processing: false, restoring: true, result: { asset: result } });
+		await vi.advanceTimersByTimeAsync(300);
+		expect(api.restore).toHaveBeenLastCalledWith(
+			expect.any(String),
+			expect.any(Number),
+			source,
+			clean,
+			expect.objectContaining({ restore_mode: 'edge' }),
+			expect.any(AbortSignal)
+		);
+		expect(studio.getSnapshot()).toMatchObject({ restoring: false, result: { asset: { id: 'restored' } } });
 	});
 });

@@ -125,6 +125,10 @@ def validate_sample(request):
     if not isinstance(device, str) or not (device in ("cpu", "mps") or
                                            device.startswith("cuda:") and device[5:].isdigit()):
         raise ValueError("device must be cpu, mps, or cuda:N")
+    if device == "cpu" and (request["offload"] != "none" or request["precision"] != "float32"):
+        raise ValueError("CPU processing requires offload=none and float32 precision")
+    if device == "mps" and request["offload"] == "sequential":
+        raise ValueError("Sequential offload is not supported on MPS")
 
 
 def is_oom(error):

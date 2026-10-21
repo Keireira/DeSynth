@@ -9,8 +9,8 @@ const MAX_PIXELS = 36_000_000;
 type CacheEntryT = { pixels: Uint8Array; width: number; height: number };
 type PixelCacheOptionsT = { load?: PixelLoaderT; maxBytes?: number };
 
-const fetchPixels: PixelLoaderT = async (asset) => {
-	const response = await fetch(`/api/pixels/${encodeURIComponent(asset.id)}`);
+const fetchPixels: PixelLoaderT = async (asset, signal) => {
+	const response = await fetch(`/api/pixels/${encodeURIComponent(asset.id)}`, { signal });
 	if (!response.ok) {
 		throw new Error('Could not read RGBA pixel data.');
 	}
@@ -21,6 +21,7 @@ const fetchPixels: PixelLoaderT = async (asset) => {
 export class PixelCache {
 	private entries = new Map<string, CacheEntryT>();
 	private retainedIds = new Set<string>();
+	private loads = new Map<AbortController, string>();
 	private bytes = 0;
 	private load: PixelLoaderT;
 	private maxBytes: number;
@@ -32,6 +33,12 @@ export class PixelCache {
 
 	retain(ids: string[]) {
 		this.retainedIds = new Set(ids);
+		for (const [controller, id] of this.loads) {
+			if (!this.retainedIds.has(id)) {
+				controller.abort();
+			}
+		}
+
 		for (const id of this.entries.keys()) {
 			if (!this.retainedIds.has(id)) {
 				this.remove(id);
@@ -56,7 +63,19 @@ export class PixelCache {
 			return cached.pixels;
 		}
 		this.remove(asset.id);
-		const pixels = await this.load(asset);
+		const controller = new AbortController();
+		this.loads.set(controller, asset.id);
+		let pixels: Uint8Array;
+
+		try {
+			pixels = await this.load(asset, controller.signal);
+			if (controller.signal.aborted) {
+				throw new DOMException('Pixel loading cancelled.', 'AbortError');
+			}
+		} finally {
+			this.loads.delete(controller);
+		}
+
 		if (pixels.length !== asset.width * asset.height * 4) {
 			throw new Error('Incomplete RGBA pixel data.');
 		}

@@ -9,7 +9,7 @@ export type DiffResponseT =
 	| { id: number; error: string }
 	| { id: number; key: string; width: number; height: number; buffer: ArrayBuffer };
 export type DiffPixelsT = { width: number; height: number; buffer: ArrayBuffer };
-export type PixelLoaderT = (asset: AssetT) => Promise<Uint8Array>;
+export type PixelLoaderT = (asset: AssetT, signal: AbortSignal) => Promise<Uint8Array>;
 export type DiffWorkerT = Pick<Worker, 'postMessage' | 'terminate'> & {
 	onmessage: ((event: MessageEvent<DiffResponseT>) => void) | null;
 	onerror: ((event: ErrorEvent) => void) | null;

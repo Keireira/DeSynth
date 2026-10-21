@@ -58,8 +58,10 @@ def img2img_sigmas(steps: int, denoise: float):
     return target / (LIGHTNING_SCHEDULER_SHIFT - (LIGHTNING_SCHEDULER_SHIFT - 1.0) * target)
 
 
-def place_pipeline(pipe, device: str, offload: str) -> None:
+def resolved_offload(device: str, offload: str) -> str:
     target = torch.device(device)
+    if target.type not in ("cpu", "cuda", "mps"):
+        raise ValueError(f"Unsupported device: {device}")
     if offload == "auto":
         offload = "sequential" if target.type == "cuda" else "model" if target.type == "mps" else "none"
     if offload not in ("none", "sequential", "model"):
@@ -68,6 +70,12 @@ def place_pipeline(pipe, device: str, offload: str) -> None:
         raise ValueError("CPU processing requires offload=none.")
     if target.type == "mps" and offload == "sequential":
         raise ValueError("Sequential offload is not supported on MPS.")
+    return offload
+
+
+def place_pipeline(pipe, device: str, offload: str) -> None:
+    target = torch.device(device)
+    offload = resolved_offload(device, offload)
     if offload == "none":
         pipe.to(str(target))
     elif target.type == "cuda":
@@ -83,6 +91,7 @@ def build_pipeline(transformer: Path, lightning: Path, device: str, offload: str
         raise ValueError("Qwen-Image requires float32 or bfloat16 precision.")
     if target.type == "cpu" and precision != "float32":
         raise ValueError("CPU processing requires float32 precision.")
+    offload = resolved_offload(device, offload)
     dtype = getattr(torch, precision)
     apply_gguf_patches()
     model = load_cached(
@@ -184,6 +193,18 @@ class Runtime:
         scale = request["lightning_scale"]
         if isinstance(scale, bool) or not isinstance(scale, (float, int)) or not math.isfinite(scale) or scale <= 0:
             raise ValueError("Lightning scale must be finite and greater than zero.")
+        embeds_key = weight_identity(embeds_path)
+        cached_embeds = self.embeds
+        if cached_embeds is None or self.embeds_key != embeds_key:
+            progress(3, "Loading embeddings")
+            loaded = torch.load(embeds_path, map_location="cpu", weights_only=True)
+            if not isinstance(loaded, dict) or any(not isinstance(loaded.get(key), torch.Tensor) for key in EMBED_KEYS):
+                raise ValueError("Embeddings cache must contain all four prompt tensors.")
+            cached_embeds = {key: loaded[key] for key in EMBED_KEYS}
+        with Image.open(request["source"]) as source:
+            image = source.convert("RGB")
+        if image.width % 16 or image.height % 16:
+            raise ValueError("Inference input dimensions must be multiples of 16.")
         key = (*base_key, scale)
         if self.pipe is None or self.pipe_key[:-1] != base_key:
             self.release()
@@ -194,21 +215,11 @@ class Runtime:
         elif self.pipe_key != key:
             self.pipe.set_adapters(["lightning"], adapter_weights=[scale])
             self.pipe_key = key
-        embeds_key = weight_identity(embeds_path)
-        if self.embeds is None or self.embeds_key != embeds_key:
-            progress(9, "Loading embeddings")
-            loaded = torch.load(embeds_path, map_location="cpu", weights_only=True)
-            if not isinstance(loaded, dict) or any(not isinstance(loaded.get(key), torch.Tensor) for key in EMBED_KEYS):
-                raise ValueError("Embeddings cache must contain all four prompt tensors.")
-            self.embeds = {key: loaded[key] for key in EMBED_KEYS}
-            self.embeds_key = embeds_key
+        self.embeds = cached_embeds
+        self.embeds_key = embeds_key
         dtype = getattr(torch, request["precision"])
         embeds = {key: value.to(device=request["device"], dtype=dtype if value.is_floating_point() else value.dtype)
                   for key, value in self.embeds.items()}
-        with Image.open(request["source"]) as source:
-            image = source.convert("RGB")
-        if image.width % 16 or image.height % 16:
-            raise ValueError("Inference input dimensions must be multiples of 16.")
         current = image
         passes = request["passes"]
         actual_steps = effective_img2img_steps(request["steps"], request["denoise"])

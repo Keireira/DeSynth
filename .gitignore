@@ -30,6 +30,7 @@ __pycache__/
 *.safetensors
 /inference/models/.*.part
 /inference/models/.*.part.json
+/inference/models/.*.download.lock
 
 # Keep reference results from original.png; ignore other outputs and caches.
 /out/*

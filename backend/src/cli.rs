@@ -1,3 +1,4 @@
+mod files;
 mod image_commands;
 mod processing;
 mod server;
@@ -202,10 +203,7 @@ pub(super) fn write_image(
     image: &image::RgbaImage,
     metadata: Option<&serde_json::Value>,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, crate::images::encode_png(image, metadata)?)?;
+    files::write(path, &crate::images::encode_png(image, metadata)?)?;
     println!("  -> {}", path.display());
     Ok(())
 }

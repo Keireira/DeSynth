@@ -49,7 +49,8 @@ export const usePresets = ({ value, session, disabled, onChange, onError }: UseP
 		}
 
 		try {
-			const saved = savePreset(presets, name, value);
+			const current = readPresets();
+			const saved = savePreset(current.presets, name, value);
 			setPresets(saved.presets);
 			setName(saved.entry.name);
 			setSelectedId(saved.entry.id);
@@ -65,7 +66,8 @@ export const usePresets = ({ value, session, disabled, onChange, onError }: UseP
 		}
 
 		try {
-			const saved = deletePreset(presets, selectedId);
+			const current = readPresets();
+			const saved = deletePreset(current.presets, selectedId);
 			setPresets(saved);
 			setName('');
 			setSelectedId('');

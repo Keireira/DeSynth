@@ -76,6 +76,25 @@ async fn broken_protocol_kills_the_session_before_restarting() {
 }
 
 #[tokio::test]
+async fn overlong_frame_without_newline_is_bounded_and_the_worker_can_restart() {
+    let Some((fixture, python)) = fake_worker(include_str!(
+        "../../inference/tests/fixtures/bridge_oversized.py"
+    )) else {
+        return;
+    };
+    let worker = Inference::new(fixture.path().to_owned(), python);
+    let reply = tokio::time::timeout(Duration::from_secs(3), worker.probe()).await;
+    if reply.is_err() {
+        worker.shutdown().await.unwrap();
+        panic!("An overlong frame must fail before a worker sends a newline");
+    }
+    let error = reply.unwrap().unwrap_err();
+    assert!(error.message.contains("exceeds 64 KiB"));
+    assert_eq!(worker.probe().await.unwrap()["ready"], true);
+    worker.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_interrupts_a_blocked_torch_command_and_rejects_queued_work() {
     let Some((fixture, python)) = fake_worker(include_str!(
         "../../inference/tests/fixtures/bridge_blocked.py"

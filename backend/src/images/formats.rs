@@ -57,6 +57,22 @@ fn tiff_color(bytes: &[u8]) -> Result<Option<RgbaImage>> {
     let (width, height) = decoder.dimensions()?;
     check_size(width, height)?;
     let samples = decoder.get_tag_u32(Tag::SamplesPerPixel)? as usize;
+    let color_samples = if interpretation == 5 { 4 } else { 3 };
+    ensure!(
+        (color_samples..=color_samples + 1).contains(&samples),
+        "Unsupported Lab/CMYK TIFF channel count: {samples}"
+    );
+    let extra_samples = decoder
+        .find_tag(Tag::ExtraSamples)?
+        .map(|value| value.into_u16_vec())
+        .transpose()?
+        .unwrap_or_default();
+    ensure!(
+        extra_samples.len() <= samples - color_samples,
+        "TIFF extra samples do not match its color channels"
+    );
+    let alpha_kind = extra_samples.first().copied().unwrap_or(0);
+    let alpha = matches!(alpha_kind, 1 | 2).then_some(color_samples);
     let orientation = decoder.get_tag_u32(Tag::Orientation).unwrap_or(1) as u8;
     let planar = decoder.get_tag_u32(Tag::PlanarConfiguration).unwrap_or(1) == 2;
     let patched;
@@ -81,10 +97,16 @@ fn tiff_color(bytes: &[u8]) -> Result<Option<RgbaImage>> {
         _ => bail!("Only 8-bit and 16-bit Lab/CMYK TIFF samples are supported"),
     };
     let count = width as usize * height as usize;
+    let decoded_samples = pixels.len() / count;
     ensure!(
-        pixels.len() == count * samples && layout.complete_len <= 512 * 1024 * 1024,
+        pixels.len().is_multiple_of(count)
+            && (decoded_samples == samples
+                || (alpha.is_none() && decoded_samples == color_samples))
+            && layout.complete_len <= 512 * 1024 * 1024,
         "TIFF color samples are incomplete"
     );
+    // The TIFF decoder may omit an explicitly unspecified extra sample.
+    let samples = decoded_samples;
     if planar {
         let planes = pixels;
         pixels = vec![0; count * samples];
@@ -94,6 +116,9 @@ fn tiff_color(bytes: &[u8]) -> Result<Option<RgbaImage>> {
             }
         }
     }
+    if alpha_kind == 1 {
+        unassociate(&mut pixels, samples, color_samples, interpretation == 8);
+    }
     if interpretation == 8 {
         // CIE Lab stores signed a/b. ICC Lab uses their unsigned midpoint at 128.
         for pixel in pixels.chunks_exact_mut(samples) {
@@ -101,16 +126,33 @@ fn tiff_color(bytes: &[u8]) -> Result<Option<RgbaImage>> {
             pixel[2] ^= 128;
         }
     }
-    let (layout, alpha) = match (interpretation == 5, samples) {
-        (true, 4) => (PixelFormat::CMYK_8, None),
-        (true, 5) => (PixelFormat::CMYKA_8, Some(4)),
-        (false, 3) => (PixelFormat::Lab_8, None),
-        (false, 4) => (PixelFormat(PixelFormat::Lab_8.0 | (1 << 7)), Some(3)),
+    let layout = match (interpretation == 5, samples) {
+        (true, 4) => PixelFormat::CMYK_8,
+        (true, 5) => PixelFormat::CMYKA_8,
+        (false, 3) => PixelFormat::Lab_8,
+        (false, 4) => PixelFormat(PixelFormat::Lab_8.0 | (1 << 7)),
         _ => bail!("Unsupported Lab/CMYK TIFF channel count: {samples}"),
     };
     let result =
         super::color::transform(&pixels, (width, height), &context, &profile, layout, alpha)?;
     Ok(Some(orient(result, orientation)))
+}
+
+fn unassociate(pixels: &mut [u8], samples: usize, color_samples: usize, signed_lab: bool) {
+    for pixel in pixels.chunks_exact_mut(samples) {
+        let alpha = i32::from(pixel[color_samples]);
+        if alpha == 0 {
+            continue;
+        }
+        for (channel, value) in pixel[..color_samples].iter_mut().enumerate() {
+            if signed_lab && matches!(channel, 1 | 2) {
+                let straight = i32::from(*value as i8) * 255 / alpha;
+                *value = straight.clamp(-128, 127) as i8 as u8;
+            } else {
+                *value = (i32::from(*value) * 255 / alpha).clamp(0, 255) as u8;
+            }
+        }
+    }
 }
 
 fn jpeg_color(bytes: &[u8]) -> Result<Option<RgbaImage>> {

@@ -2,7 +2,7 @@ use crate::{
     assets::{Assets, PreparedAsset},
     error::{ServiceError, ServiceResult},
     images, parameters,
-    studio::{Studio, prune},
+    studio::{Store, Studio, prune},
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 pub struct RestoreClient {
     pub revision: u64,
     pub assets: Vec<String>,
+    pub result: Option<String>,
 }
 pub struct RestoreTicket {
     client: String,
@@ -36,52 +37,59 @@ fn identity(payload: &Value) -> ServiceResult<(String, u64)> {
     Ok((client.to_owned(), revision))
 }
 
+/// Advance a validated request under the same lock as queue registration.
+fn advance_revision(store: &mut Store, client: &str, revision: u64) -> ServiceResult<u64> {
+    if !store.restore_clients.contains_key(client) {
+        if store.restore_clients.len() >= 8 {
+            let old = store
+                .restore_clients
+                .keys()
+                .find(|id| {
+                    !store.restore_pending.contains_key(*id)
+                        && store
+                            .restore_running
+                            .as_ref()
+                            .is_none_or(|(running, _)| running != *id)
+                })
+                .cloned()
+                .ok_or_else(|| ServiceError::busy("Too many restoration clients."))?;
+            store.restore_clients.shift_remove(&old);
+        }
+        store.restore_clients.insert(
+            client.to_owned(),
+            RestoreClient {
+                revision,
+                assets: Vec::new(),
+                result: None,
+            },
+        );
+    }
+    let current = store
+        .restore_clients
+        .get_mut(client)
+        .ok_or_else(|| ServiceError::bad("Invalid restore client."))?;
+    current.revision = current.revision.max(revision);
+    let current_revision = current.revision;
+    if store
+        .restore_pending
+        .get(client)
+        .is_some_and(|ticket| ticket.revision < current_revision)
+        && let Some(ticket) = store.restore_pending.shift_remove(client)
+    {
+        let _ = ticket.response.send(Ok(json!({"superseded":true})));
+    }
+    Ok(current_revision)
+}
+
 impl Studio {
     pub fn cancel_restore(&self, payload: Value) -> ServiceResult<Value> {
+        let (client, revision) = identity(&payload)?;
+        let mut store = self.store.lock();
         if *self.shutdown.borrow() {
             return Err(ServiceError::unavailable("The server is stopping."));
         }
-        let (client, revision) = identity(&payload)?;
-        let mut store = self.store.lock();
-        if !store.restore_clients.contains_key(&client) {
-            if store.restore_clients.len() >= 8 {
-                let old = store
-                    .restore_clients
-                    .keys()
-                    .find(|id| {
-                        !store.restore_pending.contains_key(*id)
-                            && store
-                                .restore_running
-                                .as_ref()
-                                .is_none_or(|(running, _)| running != *id)
-                    })
-                    .cloned()
-                    .ok_or_else(|| ServiceError::busy("Too many restoration clients."))?;
-                store.restore_clients.shift_remove(&old);
-            }
-            store.restore_clients.insert(
-                client.clone(),
-                RestoreClient {
-                    revision,
-                    assets: Vec::new(),
-                },
-            );
-        }
-        let current = store
-            .restore_clients
-            .get_mut(&client)
-            .ok_or_else(|| ServiceError::bad("Invalid restore client."))?;
-        current.revision = current.revision.max(revision);
-        let current_revision = current.revision;
-        if store
-            .restore_pending
-            .get(&client)
-            .is_some_and(|ticket| ticket.revision < current_revision)
-            && let Some(ticket) = store.restore_pending.shift_remove(&client)
-        {
-            let _ = ticket.response.send(Ok(json!({"superseded":true})));
-        }
-        Ok(json!({"revision":current_revision}))
+        let revision = advance_revision(&mut store, &client, revision)?;
+        Ok(json!({"revision":revision}))
     }
 
     pub async fn quick_restore(&self, payload: Value) -> ServiceResult<Value> {
@@ -98,10 +106,12 @@ impl Studio {
             .and_then(Value::as_str)
             .ok_or_else(|| ServiceError::bad("clean_id is required."))?
             .to_owned();
-        self.cancel_restore(json!({"client_id":client,"revision":revision}))?;
         let (response, receiver) = oneshot::channel();
         {
             let mut store = self.store.lock();
+            if *self.shutdown.borrow() {
+                return Err(ServiceError::unavailable("The server is stopping."));
+            }
             store
                 .assets
                 .get(&source, Some("source"))
@@ -115,13 +125,14 @@ impl Studio {
                     "This clean result belongs to a different source image.",
                 ));
             }
+            let current_revision = advance_revision(&mut store, &client, revision)?;
+            if revision < current_revision {
+                return Ok(json!({"superseded":true}));
+            }
             let current = store
                 .restore_clients
                 .get_mut(&client)
                 .ok_or_else(|| ServiceError::bad("Invalid restore client."))?;
-            if revision < current.revision {
-                return Ok(json!({"superseded":true}));
-            }
             current.assets = vec![source.clone(), clean.clone()];
             if store
                 .restore_running
@@ -184,6 +195,9 @@ impl Studio {
             } else {
                 result.map(|(prepared, metrics)| {
                     let result = store.assets.insert(prepared.commit());
+                    if let Some(client) = store.restore_clients.get_mut(&ticket.client) {
+                        client.result = Some(result.id.clone());
+                    }
                     prune(&mut store, [result.id.clone()]);
                     json!({"result":result,"metrics":metrics,"revision":ticket.revision})
                 })
@@ -208,11 +222,12 @@ impl Studio {
         let params = ticket.params.clone();
         let mut metadata = clean_asset
             .metadata
+            .clone()
             .unwrap_or_else(|| json!({"source":{"path":source_asset.path},"params":{}}));
         let directory = self.root.join("out/gui");
         self.cpu_task(move || {
-            let source = images::open(&std::fs::read(source_asset.path)?)?;
-            let clean = images::open(&std::fs::read(clean_asset.path)?)?;
+            let source = source_asset.read_image()?;
+            let clean = clean_asset.read_image()?;
             let image = images::finish(&clean, &source, &params)?;
             let metrics = images::metrics(&source, &image)?;
             let restoration = serde_json::to_value(&params).map_err(anyhow::Error::from)?;

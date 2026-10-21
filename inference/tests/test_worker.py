@@ -62,9 +62,12 @@ class ProtocolTests(unittest.TestCase):
             inference.validate_sample(request)
             for field, value in (("steps", True), ("passes", 0), ("seed", 2**63),
                                  ("denoise", float("nan")), ("lightning_scale", 0),
-                                 ("precision", "float16"), ("source", "relative.png")):
+                                 ("precision", "float16"), ("precision", "bfloat16"),
+                                 ("offload", "model"), ("source", "relative.png")):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     inference.validate_sample({**request, field: value})
+            with self.assertRaisesRegex(ValueError, "not supported on MPS"):
+                inference.validate_sample({**request, "device": "mps", "offload": "sequential"})
 
 
 class SamplingTests(unittest.TestCase):
@@ -150,8 +153,38 @@ class SamplingTests(unittest.TestCase):
             self.assertIsNone(owner.pipe)
             self.assertIsNone(owner.embeds)
 
+    def test_bad_embeddings_and_images_fail_before_replacing_a_working_pipeline(self):
+        for broken in ("embeddings", "dimensions", "image"):
+            with self.subTest(broken=broken), tempfile.TemporaryDirectory() as temporary:
+                request = self.fixture(Path(temporary))
+                if broken == "embeddings":
+                    torch.save({"prompt_embeds": torch.ones((2, 3))}, request["embeds"])
+                    error, message = ValueError, "all four prompt tensors"
+                elif broken == "dimensions":
+                    Image.new("RGB", (31, 16)).save(request["source"])
+                    error, message = ValueError, "multiples of 16"
+                else:
+                    Path(request["source"]).write_bytes(b"not an image")
+                    error, message = OSError, "cannot identify image file"
+                owner = runtime.Runtime()
+                previous = owner.pipe = Mock()
+                with patch.object(runtime, "build_pipeline") as build:
+                    with self.assertRaisesRegex(error, message):
+                        owner.run(request, Mock())
+                    build.assert_not_called()
+                self.assertIs(owner.pipe, previous)
+                self.assertFalse(Path(request["output"]).exists())
+
 
 class CompatibilityTests(unittest.TestCase):
+    def test_unsupported_offload_fails_before_loading_model_weights(self):
+        for device, offload in (("cpu", "model"), ("cpu", "sequential"), ("mps", "sequential"), ("xpu", "none")):
+            with self.subTest(device=device, offload=offload):
+                with patch.object(runtime.QwenImageTransformer2DModel, "from_single_file") as load:
+                    with self.assertRaises(ValueError):
+                        runtime.build_pipeline(Path("model.gguf"), Path("adapter.safetensors"), device, offload, "float32", .8)
+                    load.assert_not_called()
+
     def test_release_covers_each_cuda_device_after_runtime_switch(self):
         with (patch.object(torch.cuda, "is_available", return_value=True),
               patch.object(torch.cuda, "device_count", return_value=2),

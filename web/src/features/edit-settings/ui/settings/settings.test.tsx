@@ -230,6 +230,59 @@ describe('settings modal', () => {
 		expect(screen.getAllByRole('alert')).toHaveLength(1);
 	});
 
+	it('saves and deletes presets using the latest storage without losing another tab changes', () => {
+		const first = savePreset([], 'Existing', defaultSettings);
+		render(
+			<Settings
+				value={defaultSettings}
+				session={session}
+				refreshing={false}
+				onRefresh={vi.fn()}
+				onSave={vi.fn()}
+				onClose={vi.fn()}
+			/>
+		);
+		const external = savePreset(first.presets, 'From another tab', defaultSettings);
+		fireEvent.change(screen.getByLabelText('Preset name'), { target: { value: 'From this tab' } });
+		fireEvent.click(screen.getByRole('button', { name: 'Save preset' }));
+
+		expect(screen.getByRole('option', { name: 'From another tab' })).toBeDefined();
+		expect(JSON.parse(localStorage.getItem('desynth.presets.v1') || '{}').presets).toHaveLength(3);
+		const afterSave = JSON.parse(localStorage.getItem('desynth.presets.v1') || '{}');
+		savePreset(afterSave.presets, 'Added before deletion', defaultSettings);
+		fireEvent.change(screen.getByLabelText('Preset'), { target: { value: external.entry.id } });
+		fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+
+		expect(screen.getByRole('option', { name: 'Added before deletion' })).toBeDefined();
+		expect(screen.queryByRole('option', { name: 'From another tab' })).toBeNull();
+		expect(JSON.parse(localStorage.getItem('desynth.presets.v1') || '{}').presets).toHaveLength(3);
+	});
+
+	it('does not overwrite unreadable preset storage during Save or Delete', () => {
+		const existing = savePreset([], 'Existing', defaultSettings);
+		render(
+			<Settings
+				value={defaultSettings}
+				session={session}
+				refreshing={false}
+				onRefresh={vi.fn()}
+				onSave={vi.fn()}
+				onClose={vi.fn()}
+			/>
+		);
+		fireEvent.change(screen.getByLabelText('Preset'), { target: { value: existing.entry.id } });
+		localStorage.setItem('desynth.presets.v1', '{incomplete external write');
+		const writes = vi.spyOn(Storage.prototype, 'setItem');
+
+		fireEvent.click(screen.getByRole('button', { name: 'Save preset' }));
+		fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+
+		expect(writes).not.toHaveBeenCalled();
+		expect(localStorage.getItem('desynth.presets.v1')).toBe('{incomplete external write');
+		expect(screen.getByRole('alert').textContent).toBe('Could not read saved presets.');
+		expect(screen.getByRole('option', { name: 'Existing' })).toBeDefined();
+	});
+
 	it('shows failed Refresh inside the modal and keeps current draft selections', async () => {
 		const onRefresh = vi.fn().mockRejectedValue(new Error('Device refresh timed out.'));
 		render(

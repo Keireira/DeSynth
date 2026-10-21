@@ -749,6 +749,105 @@ async fn wait_until(predicate: impl Fn() -> bool) -> Result<()> {
 }
 
 #[tokio::test]
+async fn queued_image_reads_survive_cache_eviction() -> Result<()> {
+    scenario(false, |fixture| async move {
+        let image = source_image();
+        let asset = fixture.upload(&image, "result").await?;
+        let image_url = asset["url"].as_str().context("Missing image URL")?;
+        let pixels_url = format!("/api/pixels/{}", id(&asset)?);
+        let permit = fixture.studio.cpu.clone().acquire_many_owned(2).await?;
+        let mut image_read = Box::pin(fixture.get(image_url));
+        let mut pixels_read = Box::pin(fixture.get(&pixels_url));
+        ensure!(futures_util::poll!(&mut image_read).is_pending());
+        ensure!(futures_util::poll!(&mut pixels_read).is_pending());
+
+        {
+            let mut store = fixture.studio.store.lock();
+            for _ in 0..50 {
+                store
+                    .assets
+                    .save(&image, "result", "preview.png", true, None)?;
+            }
+            desynth::studio::prune(&mut store, []);
+        }
+        drop(permit);
+
+        let png = image_read.await?;
+        png.expect(StatusCode::OK)?;
+        ensure!(images::open(&png.bytes)? == image);
+        let pixels = pixels_read.await?;
+        pixels.expect(StatusCode::OK)?;
+        ensure!(pixels.bytes == *image.as_raw());
+
+        {
+            let mut store = fixture.studio.store.lock();
+            store
+                .assets
+                .save(&image, "result", "next.png", true, None)?;
+            desynth::studio::prune(&mut store, []);
+        }
+        fixture
+            .get(&pixels_url)
+            .await?
+            .expect(StatusCode::NOT_FOUND)?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn another_tabs_previews_do_not_evict_the_displayed_result() -> Result<()> {
+    scenario(false, |fixture| async move {
+        let image = source_image();
+        let source = fixture.upload(&image, "source").await?;
+        let clean = fixture.clean(&source, &image)?;
+        let request = json!({"client_id":"first-tab","revision":1,"source_id":id(&source)?,"clean_id":id(&clean)?});
+        let first = fixture.post("/api/restore", request.clone()).await?.json()?;
+        let result = &first["result"];
+        let expected = fixture.pixels(result).await?;
+
+        for revision in 1..55 {
+            let mut next = request.clone();
+            next["client_id"] = json!("second-tab");
+            next["revision"] = json!(revision);
+            fixture.post("/api/restore", next).await?.expect(StatusCode::OK)?;
+        }
+        ensure!(fixture.pixels(result).await? == expected);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn invalid_restore_requests_do_not_cancel_a_valid_preview() -> Result<()> {
+    scenario(false, |fixture| async move {
+        let image = source_image();
+        let source = fixture.upload(&image, "source").await?;
+        let clean = fixture.clean(&source, &image)?;
+        let permit = fixture.studio.cpu.clone().acquire_many_owned(2).await?;
+        let payload = json!({"client_id":"preview","revision":1,"source_id":id(&source)?,"clean_id":id(&clean)?});
+        let running = {
+            let fixture = fixture.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move { fixture.post("/api/restore", payload).await })
+        };
+        wait_until(|| fixture.studio.store.lock().restore_running.is_some()).await?;
+
+        let mut invalid = payload;
+        invalid["revision"] = json!(2);
+        invalid["source_id"] = json!("missing-source");
+        fixture.post("/api/restore", invalid).await?.expect(StatusCode::BAD_REQUEST)?;
+        drop(permit);
+
+        let reply = running.await??;
+        reply.expect(StatusCode::OK)?;
+        ensure!(reply.json()?["result"].is_object(), "Invalid input canceled a valid preview");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn asset_inventory_and_temporary_preview_files_are_bounded_and_cleaned_on_close() -> Result<()>
 {
     scenario(false, |fixture| async move {

@@ -141,10 +141,8 @@ impl Studio {
 
     pub async fn image(&self, id: &str) -> ServiceResult<(StoredAsset, image::RgbaImage)> {
         let asset = self.asset(id)?;
-        let path = asset.path.clone();
-        let image = self
-            .cpu_task(move || Ok(images::open(&std::fs::read(path)?)?))
-            .await?;
+        let reader = asset.clone();
+        let image = self.cpu_task(move || Ok(reader.read_image()?)).await?;
         Ok((asset, image))
     }
 
@@ -198,7 +196,7 @@ impl Studio {
     pub async fn image_bytes(&self, id: &str, raw: bool) -> ServiceResult<Vec<u8>> {
         let asset = self.asset(id)?;
         self.cpu_task(move || {
-            let image = images::open(&std::fs::read(asset.path)?)?;
+            let image = asset.read_image()?;
             if raw {
                 return Ok(image.into_raw());
             }
@@ -286,8 +284,8 @@ impl Studio {
         let source = self.asset(source)?;
         let result = self.asset(result)?;
         self.cpu_task(move || {
-            let source = images::open(&std::fs::read(source.path)?)?;
-            let result = images::open(&std::fs::read(result.path)?)?;
+            let source = source.read_image()?;
+            let result = result.read_image()?;
             images::metrics(&source, &result).map_err(|error| ServiceError::bad(error.to_string()))
         })
         .await
@@ -613,6 +611,7 @@ pub fn prune(store: &mut Store, extra: impl IntoIterator<Item = String>) {
     }
     for client in store.restore_clients.values() {
         protected.extend(client.assets.iter().cloned());
+        protected.extend(client.result.iter().cloned());
     }
     store.assets.prune(&protected);
 }

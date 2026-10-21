@@ -133,6 +133,61 @@ fn lab_and_cmyk_keep_exact_alpha_hidden_colors_and_exif_orientation() -> Result<
     Ok(())
 }
 
+fn tagged_tiff_variant(kind: &str, extra_sample: u16, color: &[u8], alpha: u8) -> Result<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/images")
+        .join(format!("{kind}-alpha-exif.tiff"));
+    let mut bytes = std::fs::read(path)?;
+    let directory = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+    let entries = u16::from_le_bytes(bytes[directory..directory + 2].try_into()?);
+    let mut strip = None;
+    for index in 0..usize::from(entries) {
+        let entry = directory + 2 + 12 * index;
+        match u16::from_le_bytes(bytes[entry..entry + 2].try_into()?) {
+            273 => {
+                strip = Some(u32::from_le_bytes(bytes[entry + 8..entry + 12].try_into()?) as usize)
+            }
+            338 => bytes[entry + 8..entry + 10].copy_from_slice(&extra_sample.to_le_bytes()),
+            _ => {}
+        }
+    }
+    let strip = strip.expect("The TIFF fixture has an uncompressed strip");
+    for pixel in bytes[strip..].chunks_exact_mut(color.len() + 1) {
+        pixel[..color.len()].copy_from_slice(color);
+        pixel[color.len()] = alpha;
+    }
+    Ok(bytes)
+}
+
+#[test]
+fn unspecified_tiff_extra_channels_do_not_become_transparency() -> Result<()> {
+    for (kind, color) in [("lab", vec![99, 30, 226]), ("cmyk", vec![30, 60, 90, 120])] {
+        let straight = open(&tagged_tiff_variant(kind, 2, &color, 85)?)?;
+        let unspecified = open(&tagged_tiff_variant(kind, 0, &color, 85)?)?;
+        for (actual, expected) in unspecified.pixels().zip(straight.pixels()) {
+            assert_eq!(actual.0[..3], expected.0[..3]);
+            assert_eq!(actual[3], 255);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn associated_tiff_alpha_is_removed_before_applying_its_color_profile() -> Result<()> {
+    for (kind, straight, associated) in [
+        ("lab", vec![99, 30, 226], vec![33, 10, 246]),
+        ("cmyk", vec![30, 60, 90, 120], vec![10, 20, 30, 40]),
+    ] {
+        let expected = open(&tagged_tiff_variant(kind, 2, &straight, 85)?)?;
+        let actual = open(&tagged_tiff_variant(kind, 1, &associated, 85)?)?;
+        assert_eq!(
+            actual, expected,
+            "associated {kind} samples must retain the straight color and alpha"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn ycck_jpeg_is_converted_through_its_original_ink_profile() -> Result<()> {
     assert_channels_close(

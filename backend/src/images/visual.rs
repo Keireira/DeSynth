@@ -16,11 +16,20 @@ pub fn comparison_visual(
         "Image dimensions must be positive"
     );
     let target_height = 720;
+    let max_width = 1280;
     let fitted = |image: &RgbaImage| {
         let rgb = DynamicImage::ImageRgba8(image.clone()).into_rgb8();
-        let width =
-            (u64::from(image.width()) * target_height / u64::from(image.height())).max(1) as u32;
-        DynamicImage::ImageRgb8(lanczos_three(&rgb, width, target_height as u32)).into_rgba8()
+        // A very wide, short input must not expand into a multi-gigabyte canvas.
+        let width_at_target = u64::from(image.width()) * target_height / u64::from(image.height());
+        let (width, height) = if width_at_target > max_width {
+            (
+                max_width as u32,
+                (u64::from(image.height()) * max_width / u64::from(image.width())).max(1) as u32,
+            )
+        } else {
+            (width_at_target.max(1) as u32, target_height as u32)
+        };
+        DynamicImage::ImageRgb8(lanczos_three(&rgb, width, height)).into_rgba8()
     };
     let left = fitted(source);
     let right = fitted(result);
@@ -87,6 +96,15 @@ fn text(image: &mut RgbaImage, mut x: u32, y: u32, content: &str, color: [u8; 4]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_canvas_is_bounded_for_a_very_wide_input() -> Result<()> {
+        let source = RgbaImage::from_pixel(12_000, 1, Rgba([80, 120, 200, 255]));
+        let visual = comparison_visual(&source, &source, &serde_json::json!({}))?;
+        assert_eq!(visual.dimensions(), (2624, 888));
+        assert_eq!(visual.get_pixel(24, 60), &Rgba([80, 120, 200, 255]));
+        Ok(())
+    }
 
     #[test]
     fn visual_is_labelled_and_opaque_even_for_transparent_inputs() -> Result<()> {
