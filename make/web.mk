@@ -1,6 +1,7 @@
 .PHONY: web-install web-build web-dev web-check web-format
 
 # One workspace lockfile and one copy of the formatter/linter live at the root.
+web-install: export CI := true
 web-install:
 	$(PNPM) install --frozen-lockfile
 
@@ -15,5 +16,3 @@ web-check: web-install
 
 web-format: web-install
 	$(PNPM) format
-
-setup: web-build

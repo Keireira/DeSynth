@@ -7,8 +7,8 @@ import time
 from PIL import Image, ImageFilter
 
 
-def emit(identifier, event, **values):
-    print(json.dumps(dict(id=identifier, event=event, **values)), flush=True)
+def emit(command_id, event, **values):
+    print(json.dumps({"id": command_id, "event": event, **values}), flush=True)
 
 
 for line in sys.stdin:

@@ -1,6 +1,7 @@
 //! Environment commands and verified model downloads. Python is only invoked
 //! to create/check the ML environment and run the inference worker.
 
+mod backend;
 mod download;
 mod environment;
 mod readiness;
@@ -37,15 +38,7 @@ pub async fn run(
         ["auto", "4", "8"].contains(&lightning),
         "Unknown Lightning profile: {lightning}"
     );
-    let backend = if backend == "auto" {
-        if cfg!(target_os = "macos") {
-            "cpu"
-        } else {
-            "cuda"
-        }
-    } else {
-        backend
-    };
+    let backend = backend::resolve_backend(backend).await;
     ensure!(
         !(backend == "cuda" && cfg!(target_os = "macos")),
         "CUDA is unavailable on macOS. Use BACKEND=cpu."

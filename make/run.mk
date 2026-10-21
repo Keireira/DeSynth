@@ -1,7 +1,9 @@
-.PHONY: gui run compare visual diff
+.PHONY: start gui run compare visual diff
 
-gui: web-build backend-build
+start: require-environment web-build backend-build
 	"$(DESYNTH)" --python "$(VENV_PYTHON)" gui --port "$(PORT)" $(GUI_ARGS)
+
+gui: start
 
 run: backend-build
 	"$(DESYNTH)" --python "$(VENV_PYTHON)" run "$(INPUT)" $(if $(LIGHTNING_LORA),--lightning "$(LIGHTNING_LORA)") --lightning-scale "$(LIGHTNING_SCALE)" $(ARGS)

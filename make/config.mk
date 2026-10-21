@@ -29,3 +29,5 @@ PNPM ?= pnpm
 NODE ?= node
 CARGO ?= cargo
 WEB_PORT ?= 3000
+
+ENVIRONMENT_ARGS = --venv "$(VENV)" --backend "$(BACKEND)" --model "$(MODEL)" --lightning "$(LIGHTNING)"

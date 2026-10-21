@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import inspect
 
+# Import the model stack only when a caller requests GGUF loading.
+# pylint: disable=import-outside-toplevel
+
 
 def apply_gguf_patches() -> None:
     import gguf
@@ -15,13 +18,15 @@ def apply_gguf_patches() -> None:
     from diffusers.quantizers.gguf.utils import GGUFParameter, SUPPORTED_GGUF_QUANT_TYPES
 
     original_new = GGUFParameter.__new__
-    if not getattr(original_new, "_desynth_offload", False) and "quant_type" not in inspect.signature(original_new).parameters:
+    if (not getattr(original_new, "_desynth_offload", False)
+            and "quant_type" not in inspect.signature(original_new).parameters):
         raise RuntimeError("Unsupported Diffusers GGUFParameter API. Run make install for the pinned dependencies.")
     if "gguf_checkpoint_path" not in inspect.signature(model_loading_utils.load_gguf_checkpoint).parameters:
         raise RuntimeError("Unsupported Diffusers GGUF loader API. Run make install for the pinned dependencies.")
 
     if not getattr(model_loading_utils.load_gguf_checkpoint, "_desynth_mmap", False):
-        def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
+        # Keep the pinned Diffusers loader's keyword-compatible signature.
+        def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):  # pylint: disable=unused-argument
             # Avoid a separate multi-gigabyte heap copy of mmap-backed weights.
             reader = gguf.GGUFReader(gguf_checkpoint_path)
             parsed = {}
@@ -34,7 +39,7 @@ def apply_gguf_patches() -> None:
                 parsed[tensor.name] = GGUFParameter(weights, quant_type=quant_type) if quantized else weights
             return parsed
 
-        load_gguf_checkpoint._desynth_mmap = True
+        load_gguf_checkpoint._desynth_mmap = True  # pylint: disable=protected-access
         model_loading_utils.load_gguf_checkpoint = load_gguf_checkpoint
 
     if getattr(original_new, "_desynth_offload", False):
@@ -46,13 +51,14 @@ def apply_gguf_patches() -> None:
             quant_type = data.quant_type
         if quant_type is None:
             value = data if data is not None else torch.empty(0)
-            result = torch.Tensor._make_subclass(cls, value, requires_grad)
+            # GGUFParameter relies on this pinned Torch tensor-construction API.
+            result = torch.Tensor._make_subclass(cls, value, requires_grad)  # pylint: disable=protected-access
             result.quant_type = None
             result.quant_shape = None
             return result
         return original_new(cls, data, requires_grad, quant_type)
 
-    parameter_new._desynth_offload = True
+    parameter_new._desynth_offload = True  # pylint: disable=protected-access
     GGUFParameter.__new__ = parameter_new
 
 
@@ -72,7 +78,8 @@ def _cache_miss(error: BaseException) -> bool:
 def load_cached(loader, **kwargs):
     try:
         return loader(**kwargs, local_files_only=True)
-    except Exception as error:
+    # Loaders wrap cache errors in different exception types; inspect their cause.
+    except Exception as error:  # pylint: disable=broad-exception-caught
         if not _cache_miss(error):
             raise
     # Retry outside the except block so no failed loader frame retains weights.

@@ -1,5 +1,6 @@
 # Local environments, dependencies and build output.
 .venv/
+.tools/
 node_modules/
 .pnpm-store/
 dist/

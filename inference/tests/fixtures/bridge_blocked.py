@@ -4,5 +4,5 @@ import sys
 import time
 
 for line in sys.stdin:
-    Path("started").write_text("yes")
+    Path("started").write_text("yes", encoding="utf-8")
     time.sleep(60)

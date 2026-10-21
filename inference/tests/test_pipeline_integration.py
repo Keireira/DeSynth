@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -13,10 +15,9 @@ import torch
 from diffusers import QwenImageImg2ImgPipeline
 from diffusers.image_processor import VaeImageProcessor
 
-import sys
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import runtime as ds
+# Test the same standalone modules imported by the executable worker.
+import runtime as ds  # pylint: disable=wrong-import-position
 
 
 def configured_scheduler():
@@ -24,7 +25,7 @@ def configured_scheduler():
     pipe = Mock()
     captured = {}
 
-    def load(loader, **kwargs):
+    def load(_loader, **kwargs):
         if "scheduler" in kwargs:
             captured["scheduler"] = kwargs["scheduler"]
             return pipe
@@ -55,19 +56,22 @@ class ZeroVelocityTransformer:
         return (torch.zeros_like(kwargs["hidden_states"]),)
 
 
-class PipelineProbe:
+class PipelineProbe:  # pylint: disable=too-many-instance-attributes
     """Use real preprocessing, timestep selection, latent mixing and Euler steps."""
     check_inputs = QwenImageImg2ImgPipeline.check_inputs
     encode_prompt = QwenImageImg2ImgPipeline.encode_prompt
     get_timesteps = QwenImageImg2ImgPipeline.get_timesteps
     prepare_latents = QwenImageImg2ImgPipeline.prepare_latents
-    _pack_latents = staticmethod(QwenImageImg2ImgPipeline._pack_latents)
-    _callback_tensor_inputs = QwenImageImg2ImgPipeline._callback_tensor_inputs
+    # Exercise the pinned pipeline's actual private preprocessing interfaces.
+    _pack_latents = staticmethod(QwenImageImg2ImgPipeline._pack_latents)  # pylint: disable=protected-access
+    _callback_tensor_inputs = QwenImageImg2ImgPipeline._callback_tensor_inputs  # pylint: disable=protected-access
     attention_kwargs = property(lambda self: self._attention_kwargs)
     interrupt = property(lambda self: self._interrupt)
 
     def __init__(self):
         self._execution_device = "cpu"
+        self._attention_kwargs = None
+        self._interrupt = False
         self.vae_scale_factor = 8
         self.latent_channels = 16
         self.default_sample_size = 128
@@ -82,11 +86,12 @@ class PipelineProbe:
         # Skip only VAE decoding; the returned latents expose source/noise mixing.
         return QwenImageImg2ImgPipeline.__call__(self, **kwargs, output_type="latent")
 
-    def _encode_vae_image(self, image, generator):
+    # The real pipeline supplies generator and total as keyword arguments.
+    def _encode_vae_image(self, image, generator):  # pylint: disable=unused-argument
         self.encoded_sizes.append(tuple(image.shape))
         return torch.full((1, 16, 1, image.shape[-2] // 8, image.shape[-1] // 8), 2.)
 
-    def progress_bar(self, total):
+    def progress_bar(self, total):  # pylint: disable=unused-argument
         return nullcontext(SimpleNamespace(update=lambda: None))
 
     def maybe_free_model_hooks(self):
@@ -109,6 +114,10 @@ class PipelineIntegrationTests(unittest.TestCase):
                           callback_on_step_end=callback)
 
     def test_source_noise_dimensions_callbacks_and_cfg_through_real_pipeline(self):
+        def record_step(events, _pipe, step, timestep, values):
+            events.append((step, timestep.item()))
+            return values
+
         # Reuse one scheduler across changing strengths, lengths, seeds and sizes.
         # This also catches cached begin/step indexes leaking between passes/jobs.
         cases = [(.25, 32), (.125, 32), (.01, 8), (.8, 16), (1., 8), (.25, 32)]
@@ -118,17 +127,13 @@ class PipelineIntegrationTests(unittest.TestCase):
                     seed = 42 + index
                     callbacks = []
 
-                    def callback(pipe, step, timestep, values):
-                        callbacks.append((step, timestep.item()))
-                        return values
-
                     self.pipe.transformer.calls.clear()
                     self.pipe.transformer.contexts.clear()
-                    result = self.sample(size, denoise, steps, seed, callback)
+                    result = self.sample(size, denoise, steps, seed, partial(record_step, callbacks))
                     count = ds.effective_img2img_steps(steps, denoise)
                     noise = torch.randn((1, 1, 16, size[1] // 8, size[0] // 8),
                                         generator=torch.Generator().manual_seed(seed))
-                    expected = self.pipe._pack_latents(
+                    expected = self.pipe._pack_latents(  # pylint: disable=protected-access
                         2 * (1 - denoise) + denoise * noise, 1, 16,
                         size[1] // 8, size[0] // 8,
                     )[0]
@@ -146,7 +151,7 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.pipe.encoded_sizes), 18)
 
     def test_partial_call_does_not_leave_scheduler_at_the_wrong_step(self):
-        def interrupt(pipe, step, timestep, values):
+        def interrupt(_pipe, step, _timestep, values):
             if step == 1:
                 raise RuntimeError("test interruption")
             return values

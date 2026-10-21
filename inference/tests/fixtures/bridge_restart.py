@@ -4,9 +4,9 @@ from pathlib import Path
 import sys
 
 marker = Path("restarted")
-was_started = marker.exists()
-marker.write_text("yes")
+WAS_STARTED = marker.exists()
+marker.write_text("yes", encoding="utf-8")
 for line in sys.stdin:
     request = json.loads(line)
-    identifier = request["id"] if was_started else request["id"] + 1
-    print(json.dumps(dict(id=identifier, event="result", result=dict(ready=True))), flush=True)
+    identifier = request["id"] if WAS_STARTED else request["id"] + 1
+    print(json.dumps({"id": identifier, "event": "result", "result": {"ready": True}}), flush=True)

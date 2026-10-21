@@ -11,6 +11,9 @@ import re
 import sys
 import traceback
 
+# Probing and release must work before the optional model stack is installed.
+# pylint: disable=import-outside-toplevel
+
 # Libraries can log to stdout; the executable reserves this stream for frames.
 PROTOCOL = sys.stdout
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -56,7 +59,8 @@ def probe():
                     pass
                 devices.append({"id": "mps", "name": "Apple Silicon", "type": "mps", "precisions": precisions,
                                 "offload_modes": ["model", "none"]})
-        except Exception as exc:
+        # Failed binary/runtime initialization must become a readiness diagnostic.
+        except Exception as exc:  # pylint: disable=broad-exception-caught
             error = str(exc)
             missing.append("working PyTorch runtime")
     default = next((item for item in devices if item["type"] == "cuda"),
@@ -75,7 +79,8 @@ def doctor():
     for module in (*DEPENDENCIES, "torchvision", "huggingface_hub", "sentencepiece", "google.protobuf"):
         try:
             importlib.import_module(module)
-        except Exception as error:
+        # Optional libraries can fail during native initialization, not just import.
+        except Exception as error:  # pylint: disable=broad-exception-caught
             errors.append(f"Import {module}: {error}")
     try:
         import diffusers
@@ -86,7 +91,8 @@ def doctor():
         from diffusers_compat import apply_gguf_patches
 
         apply_gguf_patches()
-    except Exception as error:
+    # Report incompatible or broken pipeline dependencies through the doctor result.
+    except Exception as error:  # pylint: disable=broad-exception-caught
         errors.append(f"Qwen pipeline: {error}")
     result["errors"] = errors
     result["ready"] = result["ready"] and not errors
@@ -110,7 +116,8 @@ def validate_sample(request):
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2**63 - request["passes"]:
         raise ValueError("seed must be nonnegative and leave room for every pass below 2**63")
     denoise = request.get("denoise")
-    if isinstance(denoise, bool) or not isinstance(denoise, (int, float)) or not math.isfinite(denoise) or not 0 < denoise <= 1:
+    if (isinstance(denoise, bool) or not isinstance(denoise, (int, float))
+            or not math.isfinite(denoise) or not 0 < denoise <= 1):
         raise ValueError("denoise must be finite, greater than zero, and at most one")
     if request["steps"] - int(max(request["steps"] - min(request["steps"] * denoise, request["steps"]), 0)) < 1:
         raise ValueError("denoise and steps must produce at least one update")
@@ -190,7 +197,8 @@ def main():
             else:
                 raise ValueError(f"Unsupported inference operation: {operation}")
             emit(identifier, "result", result=result)
-        except Exception as error:
+        # The protocol must return one error frame and continue after any command failure.
+        except Exception as error:  # pylint: disable=broad-exception-caught
             traceback.print_exc(file=sys.stderr)
             oom = is_oom(error)
             error_fields = {"error": str(error), "oom": oom}

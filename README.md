@@ -1,7 +1,6 @@
 # DeSynth
 
-Local image processing with Qwen-Image GGUF, Lightning and source detail restoration.
-Includes a browser GUI and CLI for comparing results and studying invisible image watermarks.
+A tool & pipeline for removing OpenAI & Google's SynthID watermark from images.
 
 ## Results
 
@@ -33,21 +32,36 @@ the original dimensions and alpha channel.
 
 ### Setup
 
-Install **Rust 1.94+**, **Python 3.11**, **Node.js 24 LTS**, **pnpm** and **GNU Make**, then run
-from the repository folder:
+Install [GNU Make](https://www.gnu.org/software/make/) and the tools for your OS:
+
+- **Windows:** [MSYS2](https://www.msys2.org/) provides Make;
+  [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  provides MSVC. Select **Desktop development with C++** and a **Windows SDK**.
+- **macOS:** [Xcode Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools).
+- **Linux:** your distribution's compiler tools; see the
+  [Ubuntu setup guide](https://ubuntu.com/developers/docs/howto/gcc-setup/).
+
+Linux/macOS also need `curl` and `tar`. From the repository folder:
 
 ```sh
 make setup
-make gui
+make start
 ```
 
-Setup installs dependencies and downloads models into `inference/models/`. The default is
-**Q4_K_M**, the smaller model. Keep the included `inference/models/embeds_cache.pt`.
-The editor is built from `web/`; `make gui` rebuilds it before starting.
-The backend and CLI run on Rust. The Python worker, its dependencies and tests
-live in `inference/`; comparison, RGBA diff and detail restoration run without Python.
+`make setup` finds compatible Rust, Python, Node.js and pnpm, downloading missing
+tools into `.tools/`. It installs dependencies into `.venv/` and `node_modules/`,
+builds the app and prepares models in `inference/models/`. On the first install,
+choose a model or accept **Q4_K_M**, the smaller default. Rerunning setup reuses
+installed tools and model files and resumes interrupted model downloads.
+Keep the included `inference/models/embeds_cache.pt`; VAE and model configs use
+the Hugging Face cache.
 
-For CPU-only installation, use `make setup BACKEND=cpu`.
+`make start` builds and starts the complete app at **http://127.0.0.1:8758**.
+The Rust server serves the interface and starts the Python worker automatically.
+Stop everything with **Ctrl+C**. Use `make start PORT=9000` to change the port.
+
+Setup selects CUDA when a working NVIDIA GPU is detected; otherwise it installs
+CPU dependencies. To choose explicitly, use `make setup BACKEND=cpu` or `BACKEND=cuda`.
 Use `make doctor` to check setup and `make help` to list commands.
 
 ### Models
@@ -59,21 +73,22 @@ One GGUF model and one Lightning adapter are required:
 | `Qwen-Image-2512-Q4_K_M.gguf` | ~13 GB | Default model |
 | `Qwen-Image-2512-Q8_0.gguf` | ~21.8 GB | Optional, more memory required |
 | `Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors` | ~1.7 GB | Default adapter |
+| `Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors` | ~1.7 GB | Alternative adapter |
 
 Sources: [GGUF models](https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF)
 and [Lightning adapters](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning).
-The 4-step adapter is also supported. Other quantizations of the same
-Qwen-Image-2512 model can be selected in Settings or with `--transformer`.
+Choose one adapter per run in **Settings → Lightning adapter**. Automatic prefers
+8-step FP32. Other quantizations of Qwen-Image-2512 can be selected in Settings
+or with `--transformer`.
 
-To download Q8 after setup:
+To add Q8 or the 4-step adapter:
 
 ```sh
 make models MODEL=q8
+make models LIGHTNING=4
 ```
 
 ### GUI
-
-Open **http://127.0.0.1:8758**. Stop the server with **Ctrl+C** in its terminal.
 
 ![DeSynth GUI: draggable comparison, processing controls and export](docs/images/workspace.jpg)
 
@@ -87,32 +102,6 @@ added models; **Save settings** applies choices. Sequential offload uses RAM to
 reduce VRAM use. Leave Precision on Auto.
 
 ![Model, device and preset settings](docs/images/settings.jpg)
-
-For frontend development, keep the backend running and open the React dev server:
-
-```sh
-# First terminal
-make gui GUI_ARGS="--no-browser"
-
-# Second terminal: http://127.0.0.1:3000
-make web-dev
-```
-
-`make web-check` runs TypeScript, lint, formatting checks and frontend tests.
-`make web-format` applies the shared root formatting rules.
-`make backend-check` checks Rust; `make inference-check` tests the model worker.
-
-The Rust workspace lives in `backend/crates/`: `images` handles pixels and comparisons,
-`inference` manages the Python worker, `models` handles weights and setup,
-`core` owns processing jobs and editor state, `server` exposes HTTP, and `cli` runs commands.
-Dependency versions and the lockfile are shared across the workspace.
-
-The frontend follows [Feature-Sliced Design](https://habr.com/ru/companies/inDrive/articles/693768/):
-`app → pages → widgets → features → entities → shared`. Slices expose public
-`index.ts` APIs and import lower layers through aliases from `web/tsconfig.json`.
-Components have their own `index.ts`
-and `[component-name].d.ts` for types. `make web-check` also checks these
-boundaries and circular imports.
 
 ### CLI
 
@@ -132,7 +121,8 @@ make run ARGS="--transformer inference/models/Qwen-Image-2512-Q8_0.gguf --seed 4
 For `original.png`, final images and `comparison_...` PNGs go to `out/` with
 short names such as `Original_desynth_s32_d0.250_p1_r1.95_edge.png`.
 Repeated settings update these reference images. Full runs, settings and
-intermediates stay in the local `out/runs/` archive.
+intermediates stay in the local `out/runs/` archive. Git includes reference results
+from `original.png`; other runs and intermediate `_clean` images stay local.
 
 ### Flags
 
@@ -166,6 +156,24 @@ make diff OUTPUT=out/Original_desynth_s32_d0.250_p1_r1.95.png GAIN=8
 map; Gain amplifies small changes. Black means identical pixels.
 
 ![Diff view with visible differences amplified](docs/images/diff.jpg)
+
+## Development
+
+The Rust workspace is in `backend/crates/`, the Python inference worker in
+`inference/`, and the React/TypeScript frontend in `web/`. Image comparison,
+RGBA diff and detail restoration run in Rust.
+
+| Command | Checks |
+|---|---|
+| `make backend-check` | Rust formatting, Clippy and all workspace tests |
+| `make web-check` | TypeScript, lint, formatting, architecture and frontend tests |
+| `make inference-check` | Pylint and Python worker tests |
+| `make inference-lint` | Pylint only |
+| `make web-format` | Apply frontend formatting |
+
+For frontend live reload, run `make start GUI_ARGS="--no-browser"`, then
+`make web-dev` in another terminal. The dev UI opens at **http://127.0.0.1:3000**
+and uses the backend on port 8758. Pass the same `PORT` to both commands if changed.
 
 ## Hardware
 

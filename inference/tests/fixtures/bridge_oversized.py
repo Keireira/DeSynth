@@ -6,11 +6,11 @@ import time
 
 marker = Path("oversized-started")
 if not marker.exists():
-    marker.write_text("yes")
+    marker.write_text("yes", encoding="utf-8")
     sys.stdout.write("x" * 65537)
     sys.stdout.flush()
     time.sleep(60)
 else:
     for line in sys.stdin:
         request = json.loads(line)
-        print(json.dumps(dict(id=request["id"], event="result", result=dict(ready=True))), flush=True)
+        print(json.dumps({"id": request["id"], "event": "result", "result": {"ready": True}}), flush=True)

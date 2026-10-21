@@ -5,6 +5,6 @@ import sys
 for index, line in enumerate(sys.stdin):
     request = json.loads(line)
     if index == 0:
-        print(json.dumps(dict(id=request["id"], event="error", error="out of memory", oom=True)), flush=True)
+        print(json.dumps({"id": request["id"], "event": "error", "error": "out of memory", "oom": True}), flush=True)
     else:
-        print(json.dumps(dict(id=request["id"], event="result", result=dict(ready=True))), flush=True)
+        print(json.dumps({"id": request["id"], "event": "result", "result": {"ready": True}}), flush=True)

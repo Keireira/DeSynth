@@ -15,13 +15,20 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+from diffusers.models import model_loading_utils
+from diffusers.quantizers.gguf.utils import GGUFParameter
+from gguf import GGMLQuantizationType
+from huggingface_hub.errors import LocalEntryNotFoundError
 from PIL import Image
 
 WORKER = Path(__file__).resolve().parent.parent / "worker.py"
 sys.path.insert(0, str(WORKER.parent))
+# Test the same standalone modules imported by the executable worker.
+# pylint: disable=wrong-import-position
 import worker as inference
 import runtime
 from diffusers_compat import apply_gguf_patches, load_cached
+# pylint: enable=wrong-import-position
 
 
 class ProtocolTests(unittest.TestCase):
@@ -55,10 +62,10 @@ class ProtocolTests(unittest.TestCase):
             directory = Path(temporary)
             for name in ("model", "adapter", "embeds", "source"):
                 (directory / name).write_bytes(b"placeholder")
-            request = dict(transformer=str(directory / "model"), lightning=str(directory / "adapter"),
-                           embeds=str(directory / "embeds"), source=str(directory / "source"),
-                           output=str(directory / "output.png"), denoise=.25, steps=32, passes=1,
-                           seed=42, device="cpu", offload="none", precision="float32", lightning_scale=.8)
+            request = {"transformer": str(directory / "model"), "lightning": str(directory / "adapter"),
+                       "embeds": str(directory / "embeds"), "source": str(directory / "source"),
+                       "output": str(directory / "output.png"), "denoise": .25, "steps": 32, "passes": 1,
+                       "seed": 42, "device": "cpu", "offload": "none", "precision": "float32", "lightning_scale": .8}
             inference.validate_sample(request)
             for field, value in (("steps", True), ("passes", 0), ("seed", 2**63),
                                  ("denoise", float("nan")), ("lightning_scale", 0),
@@ -83,9 +90,10 @@ class SamplingTests(unittest.TestCase):
                     "negative_prompt_embeds_mask": torch.ones(2, dtype=torch.int64), "meta": {"ignored": True}}, embeds)
         source = directory / "source.png"
         Image.new("RGB", (32, 16), (30, 50, 70)).save(source)
-        return dict(transformer=str(transformer), lightning=str(lightning), embeds=str(embeds), source=str(source),
-                    output=str(directory / "clean.png"), denoise=.25, steps=32, passes=2, seed=42,
-                    device="cpu", offload="none", precision="float32", lightning_scale=.8)
+        return {"transformer": str(transformer), "lightning": str(lightning),
+                "embeds": str(embeds), "source": str(source), "output": str(directory / "clean.png"),
+                "denoise": .25, "steps": 32, "passes": 2, "seed": 42,
+                "device": "cpu", "offload": "none", "precision": "float32", "lightning_scale": .8}
 
     def test_schedule_keeps_requested_noise_after_lightning_shift(self):
         for steps, denoise in ((32, .25), (32, .125), (8, .275), (1, 1)):
@@ -121,20 +129,25 @@ class SamplingTests(unittest.TestCase):
             pipe = Mock(num_timesteps=8)
             progress = Mock()
             samples = []
+            callbacks = []
 
             def sample(selected, image, embeds, **kwargs):
                 self.assertIs(selected, pipe)
                 self.assertEqual(embeds["prompt_embeds_mask"].dtype, torch.int64)
                 samples.append(kwargs["seed"])
+                callbacks.append(kwargs["callback_on_step_end"])
                 kwargs["callback_on_step_end"](pipe, 0, None, {})
                 return image
 
             owner = runtime.Runtime()
-            with patch.object(runtime, "build_pipeline", return_value=pipe) as build, patch.object(runtime, "sample", side_effect=sample):
+            with (patch.object(runtime, "build_pipeline", return_value=pipe) as build,
+                  patch.object(runtime, "sample", side_effect=sample)):
                 result = owner.run(request, progress)
                 owner.run(request, progress)
                 self.assertEqual(build.call_count, 1)
                 self.assertEqual(samples, [42, 43, 42, 43])
+                callbacks[0](pipe, 0, None, {})
+                self.assertIn("Pass 1/2", progress.call_args.args[1])
                 self.assertEqual(result["actual_steps"], 8)
                 self.assertTrue(Path(request["output"]).is_file())
                 with Image.open(request["output"]) as image:
@@ -182,7 +195,8 @@ class CompatibilityTests(unittest.TestCase):
             with self.subTest(device=device, offload=offload):
                 with patch.object(runtime.QwenImageTransformer2DModel, "from_single_file") as load:
                     with self.assertRaises(ValueError):
-                        runtime.build_pipeline(Path("model.gguf"), Path("adapter.safetensors"), device, offload, "float32", .8)
+                        runtime.build_pipeline(Path("model.gguf"), Path("adapter.safetensors"),
+                                               device, offload, "float32", .8)
                     load.assert_not_called()
 
     def test_release_covers_each_cuda_device_after_runtime_switch(self):
@@ -210,8 +224,6 @@ class CompatibilityTests(unittest.TestCase):
             pipe.load_lora_weights.assert_called_once()
 
     def test_cache_miss_retries_once_but_model_loading_failures_do_not(self):
-        from huggingface_hub.errors import LocalEntryNotFoundError
-
         wrapper = OSError("Diffusers wrapper")
         wrapper.__cause__ = LocalEntryNotFoundError("Not cached")
         loader = Mock(side_effect=[wrapper, "loaded"])
@@ -225,10 +237,6 @@ class CompatibilityTests(unittest.TestCase):
             loader.assert_called_once()
 
     def test_gguf_patches_are_idempotent_and_preserve_quantization_metadata(self):
-        from diffusers.models import model_loading_utils
-        from diffusers.quantizers.gguf.utils import GGUFParameter
-        from gguf import GGMLQuantizationType
-
         apply_gguf_patches()
         loader, constructor = model_loading_utils.load_gguf_checkpoint, GGUFParameter.__new__
         apply_gguf_patches()

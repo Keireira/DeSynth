@@ -16,6 +16,8 @@ for message in (".*not writable.*", ".*pooled_projection_dim.*", ".*classifier-f
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 logging.getLogger("diffusers").setLevel(logging.ERROR)
 
+# Configure the libraries before their imports can emit warnings or contact HF.
+# pylint: disable=wrong-import-position
 import numpy as np
 import torch
 from diffusers import (
@@ -28,6 +30,7 @@ from diffusers import (
 from PIL import Image
 
 from diffusers_compat import apply_gguf_patches, load_cached
+# pylint: enable=wrong-import-position
 
 QWEN_IMAGE_REPO = "Qwen/Qwen-Image"
 LIGHTNING_SCHEDULER_SHIFT = 3.0
@@ -49,7 +52,8 @@ def effective_img2img_steps(steps: int, denoise: float) -> int:
 def img2img_sigmas(steps: int, denoise: float):
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError("steps must be a positive integer")
-    if isinstance(denoise, bool) or not isinstance(denoise, (int, float)) or not math.isfinite(denoise) or not 0 < denoise <= 1:
+    if (isinstance(denoise, bool) or not isinstance(denoise, (int, float))
+            or not math.isfinite(denoise) or not 0 < denoise <= 1):
         raise ValueError("denoise must be a finite number greater than zero and at most one")
     actual = effective_img2img_steps(steps, denoise)
     if actual < 1:
@@ -134,7 +138,8 @@ def build_pipeline(transformer: Path, lightning: Path, device: str, offload: str
         scheduler=scheduler,
         dtype=dtype,
     )
-    from safetensors.torch import load_file
+    # Keep file loading in the model-construction path.
+    from safetensors.torch import load_file  # pylint: disable=import-outside-toplevel
 
     pipe.load_lora_weights(load_file(str(lightning), device="cpu"), adapter_name="lightning")
     pipe.set_adapters(["lightning"], adapter_weights=[scale])
@@ -224,10 +229,10 @@ class Runtime:
         passes = request["passes"]
         actual_steps = effective_img2img_steps(request["steps"], request["denoise"])
         for pass_index in range(passes):
-            def step_end(pipe, step, timestep, callback_kwargs):
+            def step_end(pipe, step, _timestep, callback_kwargs, current_pass=pass_index):
                 count = max(1, getattr(pipe, "num_timesteps", actual_steps))
-                progress(min(88, 12 + 76 * (pass_index + (step + 1) / count) / passes),
-                         f"Pass {pass_index + 1}/{passes} · step {step + 1}/{count}")
+                progress(min(88, 12 + 76 * (current_pass + (step + 1) / count) / passes),
+                         f"Pass {current_pass + 1}/{passes} · step {step + 1}/{count}")
                 return callback_kwargs
 
             progress(12 + 76 * pass_index / passes, f"Pass {pass_index + 1}/{passes} · encoding image")
