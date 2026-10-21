@@ -102,6 +102,11 @@ make web-dev
 `make web-format` applies the shared root formatting rules.
 `make backend-check` checks Rust; `make inference-check` tests the model worker.
 
+The Rust workspace lives in `backend/crates/`: `images` handles pixels and comparisons,
+`inference` manages the Python worker, `models` handles weights and setup,
+`core` owns processing jobs and editor state, `server` exposes HTTP, and `cli` runs commands.
+Dependency versions and the lockfile are shared across the workspace.
+
 The frontend follows [Feature-Sliced Design](https://habr.com/ru/companies/inDrive/articles/693768/):
 `app → pages → widgets → features → entities → shared`. Slices expose public
 `index.ts` APIs and import lower layers through aliases from `web/tsconfig.json`.

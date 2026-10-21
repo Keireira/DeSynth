@@ -1,0 +1,22 @@
+[package]
+name = "desynth-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+desynth-images.workspace = true
+desynth-inference.workspace = true
+desynth-models.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+image.workspace = true
+indexmap.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

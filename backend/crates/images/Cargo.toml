@@ -1,0 +1,18 @@
+[package]
+name = "desynth-images"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+font8x8.workspace = true
+image.workspace = true
+lcms2.workspace = true
+png.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tiff.workspace = true
+zune-core.workspace = true
+zune-jpeg.workspace = true

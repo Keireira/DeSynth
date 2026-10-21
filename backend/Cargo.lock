@@ -329,38 +329,108 @@ dependencies = [
 ]
 
 [[package]]
-name = "desynth"
+name = "desynth-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "desynth-core",
+ "desynth-images",
+ "desynth-models",
+ "desynth-server",
+ "image",
+ "rand 0.9.5",
+ "same-file",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "webbrowser",
+]
+
+[[package]]
+name = "desynth-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "desynth-images",
+ "desynth-inference",
+ "desynth-models",
+ "image",
+ "indexmap",
+ "parking_lot",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "desynth-images"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "font8x8",
+ "image",
+ "lcms2",
+ "png",
+ "serde",
+ "serde_json",
+ "tiff",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "desynth-inference"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "desynth-models"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "desynth-inference",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "desynth-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
- "clap",
- "font8x8",
+ "desynth-core",
+ "desynth-images",
  "futures-util",
  "image",
- "indexmap",
- "lcms2",
  "mime_guess",
- "parking_lot",
  "percent-encoding",
- "png",
- "rand 0.9.5",
- "reqwest",
- "same-file",
- "serde",
  "serde_json",
- "sha2",
  "tempfile",
- "tiff",
  "tokio",
  "tower",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "webbrowser",
- "zune-core",
- "zune-jpeg",
 ]
 
 [[package]]
