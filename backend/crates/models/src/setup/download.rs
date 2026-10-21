@@ -1,4 +1,5 @@
 use super::repository::{DownloadIdentity, Repository, select_repository_file};
+use super::request::send;
 use super::selection::{
     choose_download_model, lightning_names, selected_lightning, selected_model,
 };
@@ -42,6 +43,7 @@ async fn download_models_inner(root: &Path, model: &str, lightning: &str) -> Res
         if selected == "q8" { "Q8_0" } else { "Q4_K_M" }
     )];
     let client = Client::builder()
+        .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(60))
         .user_agent("DeSynth/0.1")
@@ -58,13 +60,14 @@ async fn download_models_inner(root: &Path, model: &str, lightning: &str) -> Res
             println!("Already present: {}", existing.display());
             continue;
         }
-        let response = client
-            .get(format!("https://huggingface.co/api/models/{repository}"))
-            .query(&[("blobs", "true")])
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await?
-            .error_for_status()?;
+        let response = send(
+            client
+                .get(format!("https://huggingface.co/api/models/{repository}"))
+                .query(&[("blobs", "true")])
+                .timeout(Duration::from_secs(30)),
+        )
+        .await
+        .with_context(|| format!("Cannot fetch the model list from {repository}"))?;
         let details: Repository = response
             .json()
             .await
@@ -108,7 +111,7 @@ async fn download_file_from_url(
         if offset > 0 {
             request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
         }
-        Ok(request.send().await?.error_for_status()?)
+        send(request).await
     })
     .await
 }

@@ -2,8 +2,14 @@ use anyhow::{Context, Result, bail, ensure};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+fn python_command(program: &Path) -> Command {
+    let mut command = Command::new(dunce::simplified(program));
+    command.env_remove("PYTHONHOME").env_remove("PYTHONPATH");
+    command
+}
+
 pub fn environment_python(directory: &Path) -> PathBuf {
-    directory.join(if cfg!(windows) {
+    dunce::simplified(directory).join(if cfg!(windows) {
         "Scripts/python.exe"
     } else {
         "bin/python"
@@ -17,7 +23,7 @@ pub(super) async fn require_environment(directory: &Path) -> Result<PathBuf> {
         "No ML environment at {}. Run make install first.",
         directory.display()
     );
-    let output = Command::new(&python)
+    let output = python_command(&python)
         .arg("--version")
         .kill_on_drop(true)
         .output()
@@ -51,7 +57,7 @@ async fn bootstrap_python(minor: Option<&str>) -> Result<(PathBuf, Vec<String>)>
         }
     }
     for (program, arguments) in candidates {
-        let output = Command::new(&program)
+        let output = python_command(&program)
             .args(&arguments)
             .arg("--version")
             .kill_on_drop(true)
@@ -85,9 +91,9 @@ fn supported_python_version(version: &str) -> bool {
 
 async fn checked_command(root: &Path, program: &Path, arguments: &[String]) -> Result<()> {
     println!("> {} {}", program.display(), arguments.join(" "));
-    let mut child = Command::new(program)
+    let mut child = python_command(program)
         .args(arguments)
-        .current_dir(root)
+        .current_dir(dunce::simplified(root))
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("Cannot start {}", program.display()))?;
@@ -112,6 +118,14 @@ async fn checked_command(root: &Path, program: &Path, arguments: &[String]) -> R
 enum EnvironmentState {
     Ready,
     Create(Option<String>),
+}
+
+fn activation_script(directory: &Path) -> PathBuf {
+    directory.join(if cfg!(windows) {
+        "Scripts/activate"
+    } else {
+        "bin/activate"
+    })
 }
 
 fn environment_state(directory: &Path) -> Result<EnvironmentState> {
@@ -144,7 +158,7 @@ fn environment_state(directory: &Path) -> Result<EnvironmentState> {
             "The existing ML environment uses Python {version}; dependencies require Python 3.11–3.13. Choose a new VENV directory."
         );
     }
-    if environment_python(directory).is_file() {
+    if environment_python(directory).is_file() && activation_script(directory).is_file() {
         return Ok(EnvironmentState::Ready);
     }
     // Match its Python minor version so existing native packages remain compatible.
@@ -153,37 +167,53 @@ fn environment_state(directory: &Path) -> Result<EnvironmentState> {
 }
 
 pub(super) async fn create_environment(root: &Path, directory: &Path) -> Result<()> {
+    let root = dunce::simplified(root);
+    let directory = dunce::simplified(directory);
     let minor = match environment_state(directory)? {
         EnvironmentState::Ready => {
-            require_environment(directory).await?;
+            let python = require_environment(directory).await?;
             println!("Using ML environment: {}", directory.display());
-            return Ok(());
+            return ensure_pip(root, &python).await;
         }
         EnvironmentState::Create(minor) => minor,
     };
     if directory.exists() {
         println!("Repairing ML environment: {}", directory.display());
     }
+    if environment_python(directory).is_file() {
+        require_environment(directory).await?;
+    }
     let (program, mut arguments) = bootstrap_python(minor.as_deref()).await?;
     arguments.extend([
         "-m".into(),
         "venv".into(),
+        "--without-pip".into(),
         directory.to_string_lossy().into_owned(),
     ]);
     checked_command(root, &program, &arguments).await?;
-    require_environment(directory).await?;
-    Ok(())
+    let python = require_environment(directory).await?;
+    ensure_pip(root, &python).await
 }
 
 async fn ensure_pip(root: &Path, python: &Path) -> Result<()> {
-    let output = Command::new(python)
+    let output = python_command(python)
         .args(["-m", "pip", "--version"])
         .kill_on_drop(true)
         .output()
         .await
         .context("Cannot check pip in the ML environment")?;
     if !output.status.success() {
-        checked_command(root, python, &["-m".into(), "ensurepip".into()]).await?;
+        checked_command(
+            root,
+            python,
+            &[
+                "-m".into(),
+                "ensurepip".into(),
+                "--upgrade".into(),
+                "--default-pip".into(),
+            ],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -191,7 +221,6 @@ async fn ensure_pip(root: &Path, python: &Path) -> Result<()> {
 pub(super) async fn install(root: &Path, directory: &Path, backend: &str) -> Result<()> {
     create_environment(root, directory).await?;
     let python = require_environment(directory).await?;
-    ensure_pip(root, &python).await?;
     let requirements = root.join(if backend == "cuda" {
         "inference/requirements/cuda.txt"
     } else {
@@ -276,6 +305,11 @@ mod tests {
         std::fs::write(&python, "Existing interpreter").unwrap();
         assert_eq!(
             environment_state(root.path()).unwrap(),
+            EnvironmentState::Create(Some("3.11".into()))
+        );
+        std::fs::write(activation_script(root.path()), "Existing activation script").unwrap();
+        assert_eq!(
+            environment_state(root.path()).unwrap(),
             EnvironmentState::Ready
         );
         std::fs::write(root.path().join("pyvenv.cfg"), "version = 3.14.0\n").unwrap();
@@ -288,40 +322,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupted_environment_recovers_its_interpreter_and_bundled_pip_offline() {
+    async fn canonical_paths_create_and_recover_the_complete_environment_offline() {
         let Ok((program, mut arguments)) = bootstrap_python(None).await else {
             eprintln!("Skipping offline venv recovery: no Python 3.11–3.13 is available.");
             return;
         };
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("environment");
+        let project = root.path().join("project with spaces");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let fresh = project.join("new environment");
+        std::fs::create_dir(&fresh).unwrap();
+        let fresh = fresh.canonicalize().unwrap();
+        crate::setup::run(&project, "venv", &fresh, "cpu", "auto", "auto")
+            .await
+            .unwrap();
+        let fresh_python = require_environment(&fresh).await.unwrap();
+        assert!(activation_script(&fresh).is_file());
+        assert!(
+            python_command(&fresh_python)
+                .args(["-m", "pip", "--version"])
+                .output()
+                .await
+                .unwrap()
+                .status
+                .success()
+        );
+        if cfg!(windows) {
+            let config = std::fs::read_to_string(fresh.join("pyvenv.cfg")).unwrap();
+            assert!(!config.contains(r"\\?\"));
+        }
+
+        let directory = project.join("interrupted environment");
         arguments.extend([
             "-m".into(),
             "venv".into(),
             "--without-pip".into(),
             directory.to_string_lossy().into_owned(),
         ]);
-        checked_command(root.path(), &program, &arguments)
+        checked_command(&project, &program, &arguments)
             .await
             .unwrap();
+        let directory = directory.canonicalize().unwrap();
         let python = require_environment(&directory).await.unwrap();
-        let pip = Command::new(&python)
+        let pip = python_command(&python)
             .args(["-m", "pip", "--version"])
             .output()
             .await
             .unwrap();
         assert!(!pip.status.success());
 
-        ensure_pip(root.path(), &python).await.unwrap();
         let preserved = directory.join("preserved.txt");
         std::fs::write(&preserved, "Keep existing environment files").unwrap();
+        let package = directory.join(if cfg!(windows) {
+            "Lib/site-packages/preserved_package.py"
+        } else {
+            "lib/preserved_package.py"
+        });
+        std::fs::write(&package, "preserved = True\n").unwrap();
+        std::fs::remove_file(activation_script(&directory)).unwrap();
+        crate::setup::run(&project, "venv", &directory, "cpu", "auto", "auto")
+            .await
+            .unwrap();
+        assert!(activation_script(&directory).is_file());
+        assert!(
+            python_command(&python)
+                .args(["-m", "pip", "--version"])
+                .output()
+                .await
+                .unwrap()
+                .status
+                .success()
+        );
+
         std::fs::remove_file(&python).unwrap();
-        create_environment(root.path(), &directory).await.unwrap();
-        ensure_pip(root.path(), &python).await.unwrap();
+        crate::setup::run(&project, "venv", &directory, "cpu", "auto", "auto")
+            .await
+            .unwrap();
+        crate::setup::run(&project, "venv", &directory, "cpu", "auto", "auto")
+            .await
+            .unwrap();
         require_environment(&directory).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(preserved).unwrap(),
             "Keep existing environment files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(package).unwrap(),
+            "preserved = True\n"
         );
     }
 }

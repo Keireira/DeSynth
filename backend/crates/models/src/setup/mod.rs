@@ -6,6 +6,7 @@ mod download;
 mod environment;
 mod readiness;
 mod repository;
+mod request;
 mod selection;
 
 pub use environment::environment_python;
@@ -43,11 +44,9 @@ pub async fn run(
         !(backend == "cuda" && cfg!(target_os = "macos")),
         "CUDA is unavailable on macOS. Use BACKEND=cpu."
     );
-    let root = root
-        .canonicalize()
-        .context("Cannot find the project root")?;
+    let root = dunce::canonicalize(root).context("Cannot find the project root")?;
     let venv = if venv.is_absolute() {
-        venv.to_path_buf()
+        dunce::simplified(venv).to_path_buf()
     } else {
         root.join(venv)
     };

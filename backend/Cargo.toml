@@ -20,6 +20,7 @@ anyhow = "1"
 axum = "0.8.9"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+dunce = "1.0.5"
 font8x8 = "0.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
 indexmap = { version = "2", features = ["serde"] }

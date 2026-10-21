@@ -404,6 +404,7 @@ dependencies = [
  "anyhow",
  "axum",
  "desynth-inference",
+ "dunce",
  "futures-util",
  "reqwest",
  "serde",
