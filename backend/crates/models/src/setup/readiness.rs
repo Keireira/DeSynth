@@ -5,13 +5,18 @@ use anyhow::{Context, Result, ensure};
 use desynth_inference::Inference;
 use std::path::{Path, PathBuf};
 
-const CACHE_FILES: [&str; 6] = [
-    "model_index.json",
-    "scheduler/scheduler_config.json",
-    "text_encoder/config.json",
-    "transformer/config.json",
-    "vae/config.json",
-    "vae/diffusion_pytorch_model.safetensors",
+const CACHE_FILES: [(&str, &[&str]); 2] = [
+    (
+        "Qwen/Qwen-Image",
+        &[
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/config.json",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ],
+    ),
+    ("Qwen/Qwen-Image-2512", &["transformer/config.json"]),
 ];
 
 pub(super) async fn prepare(root: &Path, directory: &Path) -> Result<()> {
@@ -59,14 +64,19 @@ fn hub_cache() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/huggingface/hub"))
 }
 
-fn missing_cache_files(directory: &Path) -> Vec<&'static str> {
-    let model = directory.join("models--Qwen--Qwen-Image");
-    let revision = std::fs::read_to_string(model.join("refs/main")).unwrap_or_default();
-    let snapshot = model.join("snapshots").join(revision.trim());
-    CACHE_FILES
-        .into_iter()
-        .filter(|filename| !crate::catalog::nonempty_file(&snapshot.join(filename)))
-        .collect()
+fn missing_cache_files(directory: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (repository, files) in CACHE_FILES {
+        let model = directory.join(format!("models--{}", repository.replace('/', "--")));
+        let revision = std::fs::read_to_string(model.join("refs/main")).unwrap_or_default();
+        let snapshot = model.join("snapshots").join(revision.trim());
+        for filename in files {
+            if !crate::catalog::nonempty_file(&snapshot.join(filename)) {
+                missing.push(format!("{repository}/{filename}"));
+            }
+        }
+    }
+    missing
 }
 
 pub(super) async fn doctor(
@@ -145,18 +155,87 @@ pub(super) async fn doctor(
 mod tests {
     use super::*;
 
+    fn cache_file(directory: &Path, repository: &str, revision: &str, filename: &str) {
+        let model = directory.join(format!("models--{}", repository.replace('/', "--")));
+        std::fs::create_dir_all(model.join("refs")).unwrap();
+        std::fs::write(model.join("refs/main"), revision).unwrap();
+        let path = model.join("snapshots").join(revision).join(filename);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"cached").unwrap();
+    }
+
+    fn cache_repositories(directory: &Path) {
+        for (repository, files) in CACHE_FILES {
+            let revision = if repository.ends_with("2512") {
+                "transformer-commit"
+            } else {
+                "pipeline-commit"
+            };
+            for filename in files {
+                cache_file(directory, repository, revision, filename);
+            }
+        }
+    }
+
     #[test]
-    fn cache_readiness_follows_the_main_revision() {
+    fn cache_readiness_follows_each_repositories_main_revision() {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(missing_cache_files(directory.path()).len(), 6);
-        let model = directory.path().join("models--Qwen--Qwen-Image");
-        std::fs::create_dir_all(model.join("refs")).unwrap();
-        std::fs::write(model.join("refs/main"), "commit").unwrap();
-        for name in CACHE_FILES {
-            let path = model.join("snapshots/commit").join(name);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, b"cached").unwrap();
-        }
+        cache_repositories(directory.path());
         assert!(missing_cache_files(directory.path()).is_empty());
+
+        let transformer = directory.path().join("models--Qwen--Qwen-Image-2512");
+        std::fs::write(transformer.join("refs/main"), "next-transformer-commit").unwrap();
+        assert_eq!(
+            missing_cache_files(directory.path()),
+            ["Qwen/Qwen-Image-2512/transformer/config.json"]
+        );
+        std::fs::write(transformer.join("refs/main"), "transformer-commit\n").unwrap();
+        let pipeline = directory.path().join("models--Qwen--Qwen-Image");
+        std::fs::write(pipeline.join("refs/main"), "next-pipeline-commit").unwrap();
+        let missing = missing_cache_files(directory.path());
+        assert_eq!(missing.len(), 5);
+        assert!(
+            missing
+                .iter()
+                .all(|file| file.starts_with("Qwen/Qwen-Image/"))
+        );
+    }
+
+    #[test]
+    fn old_transformer_config_cannot_replace_the_2512_config() {
+        let directory = tempfile::tempdir().unwrap();
+        for filename in CACHE_FILES[0].1 {
+            cache_file(directory.path(), "Qwen/Qwen-Image", "old-commit", filename);
+        }
+        cache_file(
+            directory.path(),
+            "Qwen/Qwen-Image",
+            "old-commit",
+            "transformer/config.json",
+        );
+        assert_eq!(
+            missing_cache_files(directory.path()),
+            ["Qwen/Qwen-Image-2512/transformer/config.json"]
+        );
+    }
+
+    #[test]
+    fn empty_files_and_unreferenced_snapshots_are_not_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        cache_repositories(directory.path());
+        let transformer = directory.path().join("models--Qwen--Qwen-Image-2512");
+        let config = transformer.join("snapshots/transformer-commit/transformer/config.json");
+        std::fs::write(&config, b"").unwrap();
+        assert_eq!(
+            missing_cache_files(directory.path()),
+            ["Qwen/Qwen-Image-2512/transformer/config.json"]
+        );
+        std::fs::write(config, b"cached").unwrap();
+        std::fs::remove_file(transformer.join("refs/main")).unwrap();
+        assert_eq!(
+            missing_cache_files(directory.path()),
+            ["Qwen/Qwen-Image-2512/transformer/config.json"]
+        );
     }
 }
